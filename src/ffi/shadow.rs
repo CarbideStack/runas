@@ -79,6 +79,17 @@ use std::ffi::{
 };
 
 /**
+ * Container for the getspnam() output
+ */
+pub struct ShadowEntry {
+    pub passwd_hash: String,
+    pub last_change: i64,
+    pub max_age: i64,
+    pub inactive: i64,
+    pub expiry: i64,
+}
+
+/**
  * Rust-safe wrapper for `libcrypt::crypt()`.
  *
  * Hashes a password using a given salt and returns the resulting hash as a `String`.
@@ -124,17 +135,22 @@ pub fn crypt(passwd: String, salt: &str) -> Option<String> {
  *
  * @param username  Username to look up
  */
-pub fn getspnam(username: &str) -> Option<String> {
+pub fn getspnam(username: &str) -> Option<ShadowEntry> {
     let c_username = CString::new(username).unwrap_or_else(|e| { errx!(1, "getspnam: {}\n\t{}", MSG_PARSE_CSTRING, e); });
 
     unsafe {
         let spwd_ptr: *mut spwd = c_ffi::getspnam(c_username.as_ptr());
         
         if spwd_ptr != ptr::null_mut() {
-            let spwd_ref = &*spwd_ptr;
-            let password_hash = CStr::from_ptr(spwd_ref.sp_pwdp).to_string_lossy().into_owned();
+            let entry = &*spwd_ptr;
             
-            return Some(password_hash);
+            return Some(ShadowEntry {
+                passwd_hash: CStr::from_ptr(entry.sp_pwdp).to_string_lossy().into_owned(),
+                last_change: entry.sp_lstchg,
+                max_age: entry.sp_max,
+                inactive: entry.sp_inact,
+                expiry: entry.sp_expire,
+            });
         }
     }
     

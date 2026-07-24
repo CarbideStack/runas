@@ -306,6 +306,9 @@ mod feat {
 #[cfg(not(feature = "use_pam"))]
 mod feat {
 
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
     use crate::shared::*;
     use crate::errx;
     use crate::modules::user::Account;
@@ -324,11 +327,40 @@ mod feat {
      * Shadow-file authentication backend.
      */
     pub fn auth(user: &Account, flags: RunFlags) -> bool {
-        if let Some(hash) = getspnam(user.name()) {
+        if let Some(entry) = getspnam(user.name()) {
+            let today = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| (duration.as_secs() / 86_400) as i64)
+                .unwrap_or(i64::MAX);
+
+            let passwd_expiry = if entry.last_change == 0 {
+                return false // Password change required
+
+            } else if entry.last_change > 0 && entry.max_age >= 0 {
+                match entry.last_change.checked_add(entry.max_age) {
+                    Some(expiry) => Some(expiry),
+                    None => return false, // Invalid shadow data
+                }
+
+            } else {
+                None // Password aging is not configured
+            };
+
+            let accnt_expired = entry.expiry >= 0 && today > entry.expiry;
+            let passwd_expired = passwd_expiry.is_some_and(|expiry| today > expiry);
+            let inactive = entry.inactive >= 0
+                && passwd_expiry
+                    .and_then(|expiry| expiry.checked_add(entry.inactive))
+                    .is_some_and(|expiry| today > expiry);
+
+            if accnt_expired || passwd_expired || inactive {
+                return false;
+            }
+
             let pwd = ask_password(PROMPT_TEXT, flags | RunFlags::PROMPT_HIDE);
             
-            if let Some(user_hash) = crypt(pwd, &hash) {
-                return time_compare(&user_hash, &hash);
+            if let Some(user_hash) = crypt(pwd, &entry.passwd_hash) {
+                return time_compare(&user_hash, &entry.passwd_hash);
             }
             
         } else {
