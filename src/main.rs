@@ -367,7 +367,7 @@ pub fn build_environment(
 fn main() {
     cfg_if! {
         if #[cfg(feature = "backend_scopex")] {
-            let mut envp:     Vec<CString>   = vec![cstring!("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")];
+            let mut envp:     Vec<CString>   = vec![cstring!("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")];
             let mut argv_out                 = Vec::new();
             let mut chdir:    Option<String> = None;
             
