@@ -87,6 +87,15 @@ Build commands demonstrate how to enable different features. Features are additi
     RUSTFLAGS="-l pam" cargo build --release --features "backend_run0,use_pam"
     ```
 
+### Systemd path
+
+The `systemd-run` executable defaults to `/usr/bin/systemd-run`. A different
+absolute path can be selected at build time using `RUNAS_SYSTEMD_PATH`:
+
+```bash
+RUNAS_SYSTEMD_PATH=/custom/path/systemd-run cargo build --release
+```
+
 ## PAM specifics
 
 When compiled with the `use_pam` feature and using the native executor:
@@ -119,4 +128,3 @@ alias runas='runas --preserve-env MYVAR'
     chmod 4750 /usr/bin/runas
     ```
 - Prefer PAM if you need richer authentication flows or session hooks; otherwise, the shadow-file mode is a compact default.
-

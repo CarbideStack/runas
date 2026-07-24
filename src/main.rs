@@ -152,7 +152,10 @@ fn get_argv_options() -> Options {
 #[cfg(not(feature = "backend_scopex"))]
 fn get_argv() -> Vec<std::ffi::CString> {
     let mut argv = vec![
-        cstring!("systemd-run")
+        cstring!(match option_env!("RUNAS_SYSTEMD_PATH") {
+            Some(path) => path,
+            None => "/usr/bin/systemd-run",
+        })
     ];
 
     cfg_if! {
