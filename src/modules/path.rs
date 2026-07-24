@@ -23,6 +23,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::ffi::CString;
 
+use std::io::{
+    self,
+    ErrorKind,
+};
+
 use std::path::{
     Path, 
     PathBuf
@@ -31,74 +36,123 @@ use std::path::{
 /**
  *
  */
-pub fn find_executable(cmd: &str, extra_envp: &[CString]) -> Option<PathBuf> {
+pub fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<PathBuf> {
     let path = Path::new(cmd);
 
     // Case 1: already absolute
     if path.is_absolute() {
-        return if is_executable(path) {
-            Some(path.to_path_buf())
-        } else {
-            None
-        };
+        return inspect_candidate(path).map(|_| path.to_path_buf());
     }
 
     // Case 2: relative (contains /)
     if cmd.contains('/') {
-        if let Ok(full) = fs::canonicalize(path) {
-            if is_executable(&full) {
-                return Some(full);
-            }
-        }
-        return None;
+        return match fs::canonicalize(path) {
+            Ok(full) => inspect_candidate(&full).map(|_| full),
+            Err(err) => Err(err),
+        };
     }
+
+    let mut permission_denied = false;
 
     // Case 3: search in current PATH
-    if let Some(found) = search_path_var(cmd, env::var("PATH").ok().as_deref()) {
-        return Some(found);
-    }
+    if let Ok(path_var) = env::var("PATH") {
+        match search_path_var(cmd, &path_var) {
+            Ok(found) => return Ok(found),
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    permission_denied = true;
 
-    // Case 4: search any PATH= in provided envp
-    for entry in extra_envp.iter().rev() {
-        if let Ok(s) = entry.to_str() {
-            if let Some(rest) = s.strip_prefix("PATH=") {
-                if let Some(found) = search_path_var(cmd, Some(rest)) {
-                    return Some(found);
+                } else if err.kind() != ErrorKind::NotFound
+                        && err.raw_os_error() != Some(nix::libc::ENOTDIR) {
+
+                    return Err(err);
                 }
             }
         }
     }
 
-    None
-}
+    // Case 4: search any PATH= in provided envp
+    for entry in extra_envp.iter().rev() {
+        let Ok(entry) = entry.to_str() else {
+            continue;
+        };
 
-/**
- *
- */
-fn is_executable(path: &Path) -> bool {
-    path.is_file() && fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
+        let Some(path_var) = entry.strip_prefix("PATH=") else {
+            continue;
+        };
 
-/**
- *
- */
-fn search_path_var(cmd: &str, path_var: Option<&str>) -> Option<PathBuf> {
-    if let Some(path_var) = path_var {
-        for dir in path_var.split(':') {
-            if dir.is_empty() {
-                continue;
-            }
-            
-            let candidate = Path::new(dir).join(cmd);
-            
-            if is_executable(&candidate) {
-                return Some(candidate);
+        match search_path_var(cmd, path_var) {
+            Ok(found) => return Ok(found),
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    permission_denied = true;
+
+                } else if err.kind() != ErrorKind::NotFound
+                        && err.raw_os_error() != Some(nix::libc::ENOTDIR) {
+
+                    return Err(err);
+                }
             }
         }
     }
-    
-    None
+
+    // Case 5: missing or permission denied
+    if permission_denied {
+        Err(io::Error::from_raw_os_error(nix::libc::EACCES))
+
+    } else {
+        Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+    }
 }
 
+/**
+ *
+ */
+fn search_path_var(cmd: &str, path_var: &str) -> io::Result<PathBuf> {
+    let mut permission_denied = false;
+
+    for dir in path_var.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+
+        let candidate = Path::new(dir).join(cmd);
+
+        match inspect_candidate(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    permission_denied = true;
+
+                } else if err.kind() != ErrorKind::NotFound
+                        && err.raw_os_error() != Some(nix::libc::ENOTDIR) {
+
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    if permission_denied {
+        Err(io::Error::from_raw_os_error(nix::libc::EACCES))
+
+    } else {
+        Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+    }
+}
+
+/**
+ *
+ */
+fn inspect_candidate(path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+
+    if !metadata.is_file() {
+        return Err(io::Error::from_raw_os_error(nix::libc::EACCES));
+
+    } else if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(io::Error::from_raw_os_error(nix::libc::EACCES));
+    }
+
+    Ok(())
+}

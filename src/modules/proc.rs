@@ -251,12 +251,14 @@ pub fn exec(
             
             let path_str = cmd.to_str().unwrap_or_else(|e| { errx!(1, "exec: {}\n\t{}", MSG_PARSE_CSTRING, e); });
             let cmd_path = match find_executable(path_str, envp) {
-                Some(path) => {
-                    CString::new(path.as_os_str().as_bytes()).unwrap_or_else(|e| { errx!(1, "exec: {}\n\t{}", MSG_PARSE_CSTRING, e); })
+                Ok(path) => {
+                    CString::new(path.as_os_str().as_bytes()).unwrap_or_else(|err| {
+                        errx!(1, "exec: {}\n\t{}", MSG_PARSE_CSTRING, err);
+                    })
                 }
-                
-                None => {
-                    errx!(1, "exec: the command could not be found");
+
+                Err(err) => {
+                    errx!(1, "exec: {}: {}", path_str, err);
                 }
             };
     
