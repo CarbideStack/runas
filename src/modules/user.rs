@@ -48,11 +48,7 @@ use nix::unistd::{
     Group as C_Group,
     Uid as C_Uid,
     Gid as C_Gid,
-    getuid
-};
-
-use nix::libc::{
-    gid_t,
+    getuid,
     getgrouplist
 };
 
@@ -326,41 +322,20 @@ impl Account {
      */
     pub fn group_list(&self) -> Ref<'_, Vec<C_Gid>> {
         if self.group_list.borrow().is_none() {
-            let     username     = CString::new(&*self.user.name).unwrap_or_else(|_e| { errx!(1, MSG_PARSE_CSTRING); });
-            let     gid:     u32 = self.user.gid.as_raw();
-            let mut ngroups: i32 = 0;
-            
-            // First call: get required number of groups
-            unsafe {
-                getgrouplist(
-                    username.as_ptr(),
-                    gid,
-                    std::ptr::null_mut(),
-                    &mut ngroups,
-                );
-            }
-            
-            // Allocate enough space for the groups
-            let mut raw_gids = Vec::<gid_t>::with_capacity(ngroups as usize);
+            let username = CString::new(self.user.name.as_str())
+                .unwrap_or_else(|_| {
+                    errx!(1, MSG_PARSE_CSTRING);
+                });
 
-            // Second call: actually fill the vector
-            unsafe {
-                getgrouplist(
-                    username.as_ptr(),
-                    gid,
-                    raw_gids.as_mut_ptr(),
-                    &mut ngroups,
-                );
-                
-                raw_gids.set_len(ngroups as usize);
-            }
-            
-            // Convert to proper Gid type
-            let mut groups: Vec<C_Gid> = Vec::with_capacity(raw_gids.len());
-            
-            for gid in &raw_gids {
-                groups.push(C_Gid::from_raw(*gid));
-            }
+            let groups = getgrouplist(username.as_c_str(), self.user.gid)
+                .unwrap_or_else(|error| {
+                    errx!(
+                        1,
+                        "Failed to retrieve groups for {}: {}",
+                        self.user.name,
+                        error
+                    );
+                });
             
             *self.group_list.borrow_mut() = Some(groups);
         }
