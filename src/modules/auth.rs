@@ -108,9 +108,12 @@ mod feat {
     
     use crate::ffi::pam::{
         PAM_SUCCESS,
+        PAM_SYSTEM_ERR,
         PAM_NEW_AUTHTOK_REQD,
         PAM_CHANGE_EXPIRED_AUTHTOK
     };
+
+    use std::mem::ManuallyDrop;
     
     cfg_if! {
         if #[cfg(feature = "backend_scopex")] {
@@ -241,12 +244,13 @@ mod feat {
                         }
                     
                         if result == PAM_SUCCESS {
+                            let pam_env = handle.getenvlist();
+                            let handle = ManuallyDrop::new(handle);
+
                             match unsafe { fork() } {
                                 Ok(ForkResult::Child) => {
                                     // Child process, return and continue
-                                    return Ok(
-                                        handle.getenvlist()
-                                    )
+                                    return Ok(pam_env);
                                 }
                                 
                                 Ok(ForkResult::Parent { child }) => {
@@ -254,7 +258,7 @@ mod feat {
                                     let status_code: i32 = watch_process(child);
                                     
                                     // Ensure that PAM has a chance to quit before terminating
-                                    drop(handle);
+                                    drop(ManuallyDrop::into_inner(handle));
                                     
                                     // Terminate the parent when the child exits
                                     process::exit(status_code);
@@ -262,6 +266,10 @@ mod feat {
                                 
                                 Err(err) => {
                                     eprintln!("fork failed: {}", err);
+
+                                    drop(ManuallyDrop::into_inner(handle));
+
+                                    return Err(PAM_SYSTEM_ERR);
                                 }
                             }
                         }
