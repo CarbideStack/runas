@@ -33,9 +33,11 @@
 
 use crate::shared::*;
 use crate::errx;
+use std::fmt;
 use std::os::unix::io::RawFd;
+use nix::errno::Errno;
 use nix::sys::stat::Mode;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use nix::libc::{
     STDIN_FILENO, 
@@ -51,16 +53,233 @@ use nix::sys::termios::{
 };
     
 use nix::fcntl::{
-    OFlag, 
-    FcntlArg, 
-    fcntl, 
+    OFlag,
     open
 };
     
 use nix::unistd::{
+    close,
     read, 
     write
 };
+
+/**
+ * 
+ */
+const MAX_INPUT_LEN: usize = 1024;
+
+/**
+ *
+ */
+#[derive(Debug)]
+enum PromptError {
+    Io(&'static str, Errno),
+    InvalidUtf8(std::str::Utf8Error),
+    BufferOverflow,
+}
+
+impl fmt::Display for PromptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(context, error) => write!(formatter, "{}\n\t{}", context, error),
+            Self::InvalidUtf8(error) => write!(formatter, "{}\n\t{}", MSG_PARSE_UTF8, error),
+            Self::BufferOverflow => write!(
+                formatter,
+                "input exceeds the maximum length of {} bytes",
+                MAX_INPUT_LEN
+            ),
+        }
+    }
+}
+
+/**
+ *
+ */
+struct Prompt {
+    input: RawFd,
+    output: RawFd,
+    owned: bool,
+    termios: Option<Termios>,
+}
+
+impl Prompt {
+    /**
+     *
+     */
+    fn new(input: RawFd, output: RawFd, owned: bool) -> Self {
+        Self {
+            input,
+            output,
+            owned,
+            termios: None,
+        }
+    }
+
+    /**
+     *
+     */
+    fn hide_input(&mut self) -> Result<(), PromptError> {
+        let original = tcgetattr(self.input).map_err(|error| PromptError::Io(MSG_IO_TTY_ATTR, error))?;
+        let mut changed = original.clone();
+
+        changed.local_flags &= !(LocalFlags::ICANON | LocalFlags::ECHO);
+
+        /*
+        * Save the complete original state before attempting the change.  If
+        * tcsetattr() partially affects a device before reporting failure,
+        * Drop still attempts to restore it.
+        */
+        self.termios = Some(original);
+        tcsetattr(self.input, SetArg::TCSANOW, &changed)
+            .map_err(|error| PromptError::Io(MSG_IO_TTY_ATTR, error))?;
+
+        Ok(())
+    }
+
+    /**
+     * 
+     */
+    fn write(&mut self, mut bytes: &[u8]) -> Result<(), PromptError> {
+        while !bytes.is_empty() {
+            match write(self.output, bytes) {
+                Ok(0) => {
+                    return Err(PromptError::Io(
+                        "failed to write prompt",
+                        Errno::EIO,
+                    ));
+                }
+                
+                Ok(written) => {
+                    bytes = &bytes[written..];
+                }
+
+                Err(error) => {
+                    return Err(PromptError::Io(
+                        "failed to write prompt",
+                        error,
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /**
+     * 
+     */
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
+        read(self.input, buf)
+    }
+}
+
+impl Drop for Prompt {
+    /**
+     *
+     */
+    fn drop(&mut self) {
+        if let Some(original) = self.termios.as_ref() {
+            let _ = write(self.output, b"\n");
+            let _ = tcsetattr(self.input, SetArg::TCSANOW, original);
+        }
+
+        if self.owned {
+            if self.input != self.output {
+                let _ = close(self.output);
+            }
+
+            let _ = close(self.input);
+        }
+    }
+}
+
+/**
+ * 
+ */
+fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
+    let use_stdin = (flags & RunFlags::AUTH_STDIN) != RunFlags::NONE;
+    let hide = (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE;
+
+    let (input, output, owned) = if use_stdin {
+        (STDIN_FILENO, STDERR_FILENO, false)
+    } else {
+        match open(PATH_TTY, OFlag::O_RDWR, Mode::empty()) {
+            Ok(fd) => (fd, fd, true),
+            Err(_) => (STDIN_FILENO, STDERR_FILENO, false),
+        }
+    };
+
+    let mut prompt = Prompt::new(input, output, owned);
+
+    if !use_stdin {
+        if hide {
+            prompt.hide_input()?;
+        }
+
+        prompt.write(msg.as_bytes())?;
+
+        // Not all PAM messages add a space at the end.
+        if !msg.ends_with(' ') {
+            prompt.write(b" ")?;
+        }
+    }
+
+    /*
+     * Zeroizing bounds the allocation and clears it on every return path.
+     * overflow counts ignored bytes beyond the limit so backspace behaves
+     * correctly without ever allowing the allocation to grow past the cap.
+     */
+    let mut buffer = Zeroizing::new(Vec::with_capacity(MAX_INPUT_LEN));
+    let mut overflow = 0usize;
+    let mut ch = [0u8; 1];
+
+    loop {
+        match prompt.read(&mut ch) {
+            Ok(0) => break,
+
+            Ok(_) => {
+                if ch[0] == b'\r' || ch[0] == b'\n' {
+                    break;
+
+                } else if !use_stdin && hide && (ch[0] == 127 || ch[0] == 8) {
+                    if overflow != 0 {
+                        overflow -= 1;
+                        let _ = prompt.write(b"\x08 \x08");
+
+                    } else if buffer.pop().is_some() {
+                        let _ = prompt.write(b"\x08 \x08");
+                    }
+
+                    continue;
+
+                } else if buffer.len() < MAX_INPUT_LEN {
+                    buffer.push(ch[0]);
+
+                } else if overflow < usize::MAX {
+                    overflow += 1;
+                }
+
+                if !use_stdin && hide {
+                    let _ = prompt.write(b"*");
+                }
+            }
+
+            Err(error) => {
+                return Err(PromptError::Io("failed to read input", error));
+            }
+        }
+    }
+
+    if overflow != 0 {
+        return Err(PromptError::BufferOverflow);
+    }
+
+    let password = std::str::from_utf8(buffer.as_slice())
+        .map_err(PromptError::InvalidUtf8)?
+        .to_owned();
+
+    Ok(password)
+}
 
 /**
  * Compare two strings in constant time.
@@ -130,126 +349,11 @@ pub fn time_compare(known: &str, secret: &str) -> bool {
  * the process terminates via `errx!()`.
  */
 pub fn ask_password(msg: &str, flags: RunFlags) -> String {
-    let mut input:        RawFd   = STDIN_FILENO;
-    let mut output:       RawFd   = STDERR_FILENO;
-    let mut flags_fcntl:  i32     = 0;
-    let mut ch:           [u8; 1] = [0; 1];
-    let mut buffer:       Vec<u8> = Vec::new();
-    let mut i:            usize   = 0;
-    let mut term_flags            = LocalFlags::empty();
-    
-    // Configure the terminal/input
-    if (flags & RunFlags::AUTH_STDIN) == RunFlags::NONE {
-        if let Ok(fd) = open(PATH_TTY, OFlag::O_RDWR, Mode::empty()) {
-            input = fd;
-            output = fd;
-        }
-        
-        if (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE {
-            if let Ok(settings) = tcgetattr(input) {
-                // Disable terminal ECHO mode
-                let mut new_settings: Termios = settings.clone();
-                
-                term_flags = new_settings.local_flags;
-                new_settings.local_flags &= !(LocalFlags::ICANON | LocalFlags::ECHO);
+    match launch_prompt(msg, flags) {
+        Ok(password) => password,
 
-                tcsetattr(input, SetArg::TCSANOW, &new_settings).unwrap_or_else(|e| { errx!(1, "ask_password: {}\n\t{}", MSG_IO_TTY_ATTR, e); });
-            
-            } else {
-                errx!(1, MSG_IO_TTY_ATTR);
-            }
-        }
-        
-        write(output, msg.as_bytes()).unwrap_or_else(|e| { errx!(1, "ask_password: {}\n\t{}", MSG_IO_TTY_ATTR, e); });
-        
-        // Not all PAM messages add a space at the end
-        if !msg.ends_with(' ') {
-            let _ = write(output, b" ");
-        }
-
-    } else if let Ok(flags) = fcntl(input, FcntlArg::F_GETFL) {
-        flags_fcntl = flags;
-    
-        // Disable blocking mode when reading from input
-        fcntl(input, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags_fcntl) | OFlag::O_NONBLOCK)).unwrap_or_else(|e| { errx!(1, "ask_password: {}\n\t{}", MSG_IO_NONBLOCK, e); });
-    
-    } else {
-        errx!(1, MSG_IO_NONBLOCK);
-    }
-    
-    // Begin reading the password into the buffer
-    while let Ok(rc) = read(input, &mut ch) {
-        if rc == 1 && ch[0] != b'\r' && ch[0] != b'\n' {
-            if (flags & RunFlags::AUTH_STDIN) == RunFlags::NONE 
-                    && (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE {
-                    
-                if ch[0] == 127 || ch[0] == 8 {
-                    // Handle backspace
-                    if i != 0 {
-                        i -= 1;
-                        write(output, b"\x08 \x08").ok();
-                    }
-                    
-                    continue;
-                
-                } else {
-                    buffer.insert(i, ch[0]);
-                    write(output, b"*").ok();
-                }
-                
-            } else {
-                buffer.push(ch[0]);
-            }
-            
-            i += 1;
-        
-        } else {
-            break;
+        Err(error) => {
+            errx!(1, "ask_password: {}", error);
         }
     }
-    
-    // Reset the terminal/input
-    if (flags & RunFlags::AUTH_STDIN) == RunFlags::NONE 
-            && (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE {
-    
-        write(output, b"\n").ok();
-        
-        // Reset ECHO mode back to default settings
-        if let Ok(settings) = tcgetattr(input) {
-            let mut new_settings: Termios = settings.clone();
-            
-            /*
-             * local_flags is not an integer types. It's an object that implements
-             * bitwise operations against it's own type. This means that we cannot
-             * assign a value directly, but we can inverse the old value, append it
-             * using bitwise-and to reset it and then append the new (old) flags.
-             */
-            new_settings.local_flags &= !(new_settings.local_flags);
-            new_settings.local_flags |= term_flags;
-
-            tcsetattr(input, SetArg::TCSANOW, &new_settings).ok();
-        }
-        
-    } else if (flags & RunFlags::AUTH_STDIN) != RunFlags::NONE {
-        // Re-enable blocking mode in input
-        fcntl(input, FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags_fcntl))).ok();
-    }
-    
-    let result = match std::str::from_utf8(&buffer[..i]) {
-        Ok(s) => s.to_string(),
-        Err(e) => {
-            buffer.zeroize();
-            ch[0] = b'\0';
-            
-            errx!(1, "ask_password: {}\n\t{}", MSG_PARSE_UTF8, e);
-        }
-    };
- 
-    if (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE {
-        buffer.zeroize();
-        ch[0] = b'\0';
-    }
-    
-    result
 }
-
