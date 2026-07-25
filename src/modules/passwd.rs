@@ -34,10 +34,33 @@
 use crate::shared::*;
 use crate::errx;
 use std::fmt;
-use std::os::unix::io::RawFd;
 use nix::errno::Errno;
 use nix::sys::stat::Mode;
 use zeroize::Zeroizing;
+
+use std::os::unix::io::{
+    AsRawFd, 
+    RawFd
+};
+
+use nix::poll::{
+    poll, 
+    PollFd, 
+    PollFlags
+};
+
+use nix::sys::signalfd::{
+    SfdFlags, 
+    SignalFd
+};
+
+use nix::sys::signal::{
+    pthread_sigmask,
+    raise,
+    SigSet,
+    SigmaskHow,
+    Signal
+};
 
 use nix::libc::{
     STDIN_FILENO, 
@@ -69,6 +92,87 @@ use nix::unistd::{
 const MAX_INPUT_LEN: usize = 1024;
 
 /**
+ * 
+ */
+struct SignalHandler {
+    previous_mask: SigSet,
+    descriptor: SignalFd,
+}
+
+impl SignalHandler {
+    /**
+     * 
+     */
+    fn install() -> Result<Self, PromptError> {
+        let mut signals = SigSet::empty();
+        signals.add(Signal::SIGHUP);
+        signals.add(Signal::SIGINT);
+        signals.add(Signal::SIGQUIT);
+        signals.add(Signal::SIGTERM);
+        signals.add(Signal::SIGTSTP);
+
+        let mut previous_mask = SigSet::empty();
+
+        pthread_sigmask(
+            SigmaskHow::SIG_BLOCK,
+            Some(&signals),
+            Some(&mut previous_mask),
+        )
+        .map_err(|error| PromptError::Io("failed to block prompt signals", error))?;
+
+        match SignalFd::with_flags(&signals, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK) {
+            Ok(descriptor) => Ok(Self {
+                descriptor,
+                previous_mask,
+            }),
+
+            Err(error) => {
+                /*
+                 * Self was not constructed, so Drop cannot restore the mask.
+                 */
+                let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous_mask), None);
+
+                Err(PromptError::Io("failed to create signal descriptor", error))
+            }
+        }
+    }
+
+    /**
+     * 
+     */
+    fn descriptor(&self) -> RawFd {
+        self.descriptor.as_raw_fd()
+    }
+
+    /**
+     * 
+     */
+    fn read_signal(&mut self) -> Result<Option<Signal>, PromptError> {
+        let info = self
+            .descriptor
+            .read_signal()
+            .map_err(|error| PromptError::Io("failed to read signal descriptor", error))?;
+
+        match info {
+            Some(info) => Signal::try_from(info.ssi_signo as i32)
+                .map(Some)
+                .map_err(|error| PromptError::Io("invalid signal number", error)),
+
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for SignalHandler {
+    /**
+     * 
+     */
+    fn drop(&mut self) {
+        let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.previous_mask), None);
+    }
+}
+
+/**
  *
  */
 #[derive(Debug)]
@@ -76,6 +180,7 @@ enum PromptError {
     Io(&'static str, Errno),
     InvalidUtf8(std::str::Utf8Error),
     BufferOverflow,
+    Interrupted(Signal),
 }
 
 impl fmt::Display for PromptError {
@@ -88,6 +193,7 @@ impl fmt::Display for PromptError {
                 "input exceeds the maximum length of {} bytes",
                 MAX_INPUT_LEN
             ),
+            Self::Interrupted(signal) => write!(formatter, "interrupted by {}", signal),
         }
     }
 }
@@ -98,6 +204,7 @@ impl fmt::Display for PromptError {
 struct Prompt {
     input: RawFd,
     output: RawFd,
+    interrupt: RawFd,
     owned: bool,
     termios: Option<Termios>,
 }
@@ -106,10 +213,11 @@ impl Prompt {
     /**
      *
      */
-    fn new(input: RawFd, output: RawFd, owned: bool) -> Self {
+    fn new(input: RawFd, output: RawFd, interrupt: RawFd, owned: bool) -> Self {
         Self {
             input,
             output,
+            interrupt,
             owned,
             termios: None,
         }
@@ -153,6 +261,8 @@ impl Prompt {
                     bytes = &bytes[written..];
                 }
 
+                Err(Errno::EINTR) => continue,
+
                 Err(error) => {
                     return Err(PromptError::Io(
                         "failed to write prompt",
@@ -169,7 +279,36 @@ impl Prompt {
      * 
      */
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
-        read(self.input, buf)
+        loop {
+            let mut descriptors = [
+                PollFd::new(self.input, PollFlags::POLLIN),
+                PollFd::new(self.interrupt, PollFlags::POLLIN),
+            ];
+
+            match poll(&mut descriptors, -1) {
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(error),
+            }
+
+            let interrupt_events = descriptors[1].revents().unwrap_or(PollFlags::empty());
+
+            if interrupt_events.contains(PollFlags::POLLIN) {
+                return Err(Errno::EINTR);
+
+            } else if interrupt_events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL) {
+                return Err(Errno::EIO);
+            }
+
+            let input_events = descriptors[0].revents().unwrap_or(PollFlags::empty());
+
+            if input_events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+                return read(self.input, buf);
+
+            } else if input_events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                return Err(Errno::EIO);
+            }
+        }
     }
 }
 
@@ -197,6 +336,13 @@ impl Drop for Prompt {
  * 
  */
 fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
+    /*
+     * Rust drops locals in reverse order, so
+     * Prompt restores the terminal before SignalHandler restores the old
+     * signal actions.
+     */
+    let mut signals = SignalHandler::install()?;
+
     let use_stdin = (flags & RunFlags::AUTH_STDIN) != RunFlags::NONE;
     let hide = (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE;
 
@@ -209,7 +355,7 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
         }
     };
 
-    let mut prompt = Prompt::new(input, output, owned);
+    let mut prompt = Prompt::new(input, output, signals.descriptor(), owned);
 
     if !use_stdin {
         if hide {
@@ -261,6 +407,12 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
 
                 if !use_stdin && hide {
                     let _ = prompt.write(b"*");
+                }
+            }
+
+            Err(Errno::EINTR) => {
+                if let Some(signal) = signals.read_signal()? {
+                    return Err(PromptError::Interrupted(signal));
                 }
             }
 
@@ -349,11 +501,23 @@ pub fn time_compare(known: &str, secret: &str) -> bool {
  * the process terminates via `errx!()`.
  */
 pub fn ask_password(msg: &str, flags: RunFlags) -> String {
-    match launch_prompt(msg, flags) {
-        Ok(password) => password,
+    loop {
+        match launch_prompt(msg, flags) {
+            Ok(password) => return password,
 
-        Err(error) => {
-            errx!(1, "ask_password: {}", error);
+            Err(PromptError::Interrupted(signal)) => {
+                /*
+                * If SIGTSTP stops the process, retry the prompt after SIGCONT.
+                * If another signal was ignored or handled by the caller,
+                * retry as well.  Signals with their default terminating action
+                * do not return from raise().
+                */
+                let _ = raise(signal);
+            }
+
+            Err(error) => {
+                errx!(1, "ask_password: {}", error);
+            }
         }
     }
 }
