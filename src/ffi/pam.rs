@@ -46,7 +46,8 @@ use crate::{
     
 use std::{
     mem, 
-    ptr
+    ptr,
+    slice
 };
     
 use nix::libc::{
@@ -137,6 +138,87 @@ pub trait PamConv {
 // -------------------------
 
 /**
+ * 
+ */
+struct PamResponses {
+    ptr: *mut pam_response,
+    count: usize,
+}
+
+impl PamResponses {
+    /**
+     * 
+     */
+    fn new(count: usize) -> Option<Self> {
+        let ptr = unsafe {
+            calloc(count as size_t, mem::size_of::<pam_response>() as size_t) as *mut pam_response
+        };
+
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { ptr, count })
+        }
+    }
+
+    /**
+     * 
+     */
+    unsafe fn get_ptr(&mut self, index: usize) -> &mut pam_response {
+        unsafe { 
+            &mut *self.ptr.add(index) 
+        }
+    }
+
+    /**
+     * 
+     */
+    unsafe fn transfer_to(mut self, output: *mut *mut pam_response) {
+        unsafe {
+            *output = self.ptr;
+        }
+        self.ptr = ptr::null_mut();
+    }
+}
+
+impl Drop for PamResponses {
+    /**
+     * 
+     */
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+
+        for index in 0..self.count {
+            let response = unsafe { 
+                &mut *self.ptr.add(index) 
+            };
+
+            if !response.resp.is_null() {
+                let len = unsafe { 
+                    CStr::from_ptr(response.resp).to_bytes_with_nul().len() 
+                };
+
+                let bytes = unsafe { 
+                    slice::from_raw_parts_mut(response.resp as *mut u8, len) 
+                };
+
+                bytes.zeroize();
+                unsafe {
+                    free(response.resp as *mut c_void);
+                }
+                response.resp = ptr::null_mut();
+            }
+        }
+
+        unsafe {
+            free(self.ptr as *mut c_void);
+        }
+    }
+}
+
+/**
  * FFI-compatible callback adapter between PAM and a Rust `PamConv` object.
  *
  * Called internally by PAM through the `pam_conv` structure.
@@ -147,58 +229,59 @@ unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
         num_msg: c_int, 
         msg: *mut *const pam_message, 
         resp: *mut *mut pam_response, 
-        appdata_ptr: *mut c_void) -> c_int {
-    
-    let mut result = PAM_SUCCESS;
-    let reply = unsafe {
-        calloc(num_msg as size_t, mem::size_of::<pam_response>() as size_t) as *mut pam_response
-    };
+        appdata_ptr: *mut c_void
+) -> c_int {
 
-    if reply.is_null() {
-        return PAM_BUF_ERR as c_int;
+    if num_msg <= 0
+        || num_msg as u32 > PAM_MAX_NUM_MSG
+        || msg.is_null()
+        || resp.is_null()
+        || appdata_ptr.is_null()
+    {
+        return PAM_CONV_ERR as c_int;
     }
+
+    unsafe {
+        *resp = ptr::null_mut();
+    }
+
+    let mut replies = match PamResponses::new(num_msg as usize) {
+        Some(replies) => replies,
+        None => return PAM_BUF_ERR as c_int,
+    };
 
     let callback = unsafe {
         &mut *(appdata_ptr as *mut T)
     };
 
     for i in 0..num_msg {
-        let reqest_ptr = unsafe { 
-            *(msg.offset(i as isize)) as *const pam_message 
+        let request_ptr = unsafe { 
+            *(msg.add(i as usize)) as *const pam_message 
         };
         
-        let reply_ptr = unsafe { 
-            reply.offset(i as isize) as *mut pam_response 
-        };
-        
-        if reqest_ptr == ptr::null() || reply_ptr == ptr::null_mut() {
-            errx!(1, "pam_conv: {}", MSG_PAM_NULL_POINTER);
+        if request_ptr.is_null() {
+            return PAM_CONV_ERR as c_int;
         }
         
-        let reqest = unsafe {
-            &(*reqest_ptr)
+        let request = unsafe {
+            &(*request_ptr)
         };
         
-        let reply = unsafe {
-            &mut *reply_ptr
-        };
-        
-        let msg = if reqest.msg == ptr::null() {
+        let msg = if request.msg.is_null() {
             EMPTY
             
         } else {
-            unsafe {
-                unwrap!(
-                    result CStr::from_ptr(reqest.msg).to_str()
-                )
+            match unsafe { CStr::from_ptr(request.msg) }.to_str() {
+                Ok(message) => message,
+                Err(_) => return PAM_CONV_ERR as c_int,
             }
         };
         
-        match reqest.msg_style as u32 {
+        match request.msg_style as u32 {
             PAM_PROMPT_ECHO_ON |
             PAM_PROMPT_ECHO_OFF => {
             
-                let style = if reqest.msg_style as u32 == PAM_PROMPT_ECHO_ON
+                let style = if request.msg_style as u32 == PAM_PROMPT_ECHO_ON
                         && !msg.to_lowercase().contains("password") {
                     CONV::ECHO_ON
                 } else {
@@ -206,35 +289,37 @@ unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
                 };
                 
                 let zero_out = style == CONV::ECHO_OFF;
-            
-                if let Ok(ret) = callback.prompt(msg, style) {
-                    // Consume into bytes
-                    let mut bytes = ret.into_bytes();
-                    // Make it CString compatible
-                    bytes.push(0u8);
-                    
-                    // Copy the data using PAM compatible allocator
-                    let dup_ptr = unsafe { 
-                        strdup(bytes.as_ptr() as *const c_char) 
-                    };
-                    
-                    if dup_ptr.is_null() {
-                        bytes.zeroize();
-                        errx!(1, "pam_conv: strdup failed (ENOMEM)");
-                    }
-                    
-                    // Clear original data
-                    if zero_out {
-                        bytes.zeroize();
-                        drop(bytes);
-                    }
-                    
-                    // PAM will free this later
-                    reply.resp = dup_ptr as *mut c_char;
-                    
-                } else {
-                    result = PAM_CONV_ERR;
+                let answer = match callback.prompt(msg, style) {
+                    Ok(answer) => answer,
+                    Err(_) => return PAM_CONV_ERR as c_int,
+                };
+
+                // Consume into bytes
+                let mut bytes = answer.into_bytes();
+
+                // Make it CString compatible
+                bytes.push(0u8);
+
+                // Copy the data using PAM compatible allocator
+                let dup_ptr = unsafe { 
+                    strdup(bytes.as_ptr() as *const c_char) 
+                };
+
+                if zero_out {
+                    bytes.zeroize();
                 }
+
+                if dup_ptr.is_null() {
+                    return PAM_BUF_ERR as c_int;
+                }
+            
+                /*
+                 * Give PamResponses ownership immediately so any later panic or
+                 * error clears this allocation along with earlier responses.
+                 */
+                let response = unsafe { replies.get_ptr(i as usize) };
+                response.resp = dup_ptr;
+                response.resp_retcode = 0;
             }
             
             PAM_ERROR_MSG => {
@@ -245,26 +330,17 @@ unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
                 callback.msg(msg, CONV::MSG);
             }
             
-            _ => result = PAM_CONV_ERR
-        }
-        
-        if result != PAM_SUCCESS {
-            break;
+            _ => {
+                return PAM_CONV_ERR as c_int;
+            }
         }
     }
     
-    if result != PAM_SUCCESS {
-        unsafe {
-            free(reply as *mut c_void);
-        }
-    
-    } else {
-        unsafe {
-            *resp = reply;
-        }
+    unsafe {
+        replies.transfer_to(resp);
     }
-    
-    return result as c_int;
+
+    PAM_SUCCESS as c_int
 }
 
 // -------------------------
@@ -499,4 +575,3 @@ pub fn pam_start<T: PamConv>(service: &str, username: &str, conversation: &mut T
     
     Err(result)
 }
-
