@@ -38,6 +38,11 @@ use std::cell::Cell;
 use zeroize::Zeroize;
 use std::ffi::CStr;
 
+use std::panic::{
+    AssertUnwindSafe, 
+    catch_unwind
+};
+
 use crate::{
     unwrap,
     cstring,
@@ -225,7 +230,7 @@ impl Drop for PamResponses {
  * Performs string decoding, allocates a response array, and invokes the
  * user-defined callback. Errors are mapped to PAM_CONV_ERR.
  */
-unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
+unsafe extern "C" fn pam_conv_process<T: PamConv>(
         num_msg: c_int, 
         msg: *mut *const pam_message, 
         resp: *mut *mut pam_response, 
@@ -341,6 +346,23 @@ unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
     }
 
     PAM_SUCCESS as c_int
+}
+
+/**
+ * 
+ */
+unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
+    num_msg: c_int,
+    msg: *mut *const pam_message,
+    resp: *mut *mut pam_response,
+    appdata_ptr: *mut c_void,
+) -> c_int {
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        pam_conv_process::<T>(num_msg, msg, resp, appdata_ptr)
+    })) {
+        Ok(result) => result,
+        Err(_) => PAM_CONV_ERR as c_int,
+    }
 }
 
 // -------------------------
