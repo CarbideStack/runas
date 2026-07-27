@@ -133,7 +133,9 @@ mod feat {
                 isatty, 
                 ttyname,
                 fork,
-                ForkResult
+                ForkResult,
+                Pid,
+                setpgid
             };
         }
     }
@@ -249,6 +251,9 @@ mod feat {
 
                             match unsafe { fork() } {
                                 Ok(ForkResult::Child) => {
+                                    // Create process group
+                                    setpgid(Pid::from_raw(0), Pid::from_raw(0));
+
                                     // Child process, return and continue
                                     return Ok(pam_env);
                                 }

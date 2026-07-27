@@ -34,8 +34,11 @@ cfg_if! {
         use crate::shared::*;
         use super::path::find_executable;
         use nix::libc::gid_t;
+        use nix::errno::Errno;
         use std::os::unix::ffi::OsStrExt;
+        use std::os::fd::AsRawFd;
         use std::time::Duration;
+        use std::io;
 
         use std::{
             thread,
@@ -64,10 +67,14 @@ cfg_if! {
         
         use nix::sys::wait::{
             waitpid,
-            WaitStatus
+            WaitStatus,
+            WaitPidFlag
         };
         
         use nix::unistd::{
+            setpgid,
+            tcgetpgrp,
+            tcsetpgrp,
             execve,
             Pid
         };
@@ -91,8 +98,139 @@ static CAUGHT_SIGNAL: AtomicI32 = AtomicI32::new(0);
  *
  */
 #[cfg(feature = "backend_scopex")]
+const FORWARDED_SIGNALS: &[Signal] = &[
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGQUIT,
+    Signal::SIGTERM,
+    Signal::SIGALRM,
+    Signal::SIGTSTP,
+    Signal::SIGCONT,
+    Signal::SIGWINCH,
+];
+
+/**
+ *
+ */
+#[cfg(feature = "backend_scopex")]
 extern "C" fn catch_signal(signum: c_int) {
-    CAUGHT_SIGNAL.compare_exchange(0, signum, Ordering::SeqCst, Ordering::SeqCst).ok();
+    CAUGHT_SIGNAL.store(signum, Ordering::SeqCst);
+}
+
+/**
+ * 
+ */
+#[cfg(feature = "backend_scopex")]
+struct SignalHandler {
+    actions: Vec<(Signal, SigAction)>,
+    foreground_group: Option<(i32, Pid, Pid)>,
+}
+
+#[cfg(feature = "backend_scopex")]
+impl SignalHandler {
+    /**
+     * 
+     */
+    fn forward_signal(group: Pid) -> Option<Signal> {
+        let raw = CAUGHT_SIGNAL.swap(0, Ordering::SeqCst);
+        let caught = Signal::try_from(raw).ok()?;
+
+        /*
+        * kill() with a negative PID addresses the entire child process group.
+        */
+        let _ = signal::kill(Pid::from_raw(-group.as_raw()), caught);
+        Some(caught)
+    }
+
+    /**
+     * 
+     */
+    fn install(child: Pid) -> nix::Result<Self> {
+        let action = SigAction::new(
+            SigHandler::Handler(catch_signal),
+            SaFlags::empty(),
+            SigSet::empty(),
+        );
+        let mut actions = Vec::with_capacity(FORWARDED_SIGNALS.len());
+
+        for &sig in FORWARDED_SIGNALS {
+            match unsafe { signal::sigaction(sig, &action) } {
+                Ok(prev) => actions.push((sig, prev)),
+
+                Err(e) => {
+                    for (sig, prev) in actions.into_iter().rev() {
+                        let _ = unsafe { signal::sigaction(sig, &prev) };
+                    }
+
+                    return Err(e);
+                }
+            }
+        }
+
+        /*
+         * A background supervisor must ignore SIGTTOU while transferring
+         * terminal ownership to and from the child process group.
+         */
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+        match unsafe { signal::sigaction(Signal::SIGTTOU, &ignore) } {
+            Ok(prev) => actions.push((Signal::SIGTTOU, prev)),
+            Err(error) => {
+                for (sig, prev) in actions.into_iter().rev() {
+                    let _ = unsafe { signal::sigaction(sig, &prev) };
+                }
+
+                return Err(error);
+            }
+        }
+
+        /*
+         * Give the child process group control of the terminal. Ignore errors
+         * when stdin is not a controlling terminal.
+         */
+        let terminal = io::stdin().as_raw_fd();
+        let foreground_group = tcgetpgrp(terminal).ok().and_then(|original| {
+            tcsetpgrp(terminal, child)
+                .ok()
+                .map(|_| (terminal, original, child))
+        });
+
+        Ok(Self {
+            actions,
+            foreground_group,
+        })
+    }
+
+    /**
+     * 
+     */
+    fn transfer_to_parent(&self) {
+        if let Some((terminal, original, _)) = self.foreground_group {
+            let _ = tcsetpgrp(terminal, original);
+        }
+    }
+
+    /**
+     * 
+     */
+    fn transfer_to_child(&self) {
+        if let Some((terminal, _, child)) = self.foreground_group {
+            let _ = tcsetpgrp(terminal, child);
+        }
+    }
+}
+
+#[cfg(feature = "backend_scopex")]
+impl Drop for SignalHandler {
+    /**
+     * 
+     */
+    fn drop(&mut self) {
+        self.transfer_to_parent();
+
+        for &(sig, ref prev) in self.actions.iter().rev() {
+            let _ = unsafe { signal::sigaction(sig, prev) };
+        }
+    }
 }
 
 /**
@@ -100,121 +238,74 @@ extern "C" fn catch_signal(signum: c_int) {
  */
 #[cfg(feature = "backend_scopex")]
 pub fn watch_process(pid: Pid) -> i32 {
-    let mut status_code: i32 = 0;
-    let     all              = SigSet::all();
-    let     proc             = pid.as_raw();
-    let mut alive: bool      = proc >= 0;
-    
-    // Disable all signals targeting this application
-    if let Err(e) = signal::pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&all), None) {
-        eprintln!("failed to block signals: {}", e);
-        status_code = 1;
+
+    // Create the process group
+    if setpgid(pid, pid).is_err() {
+        eprintln!("failed to create child process group");
+        return 1;
     }
-    
-    let mut old_action: Option<SigAction> = None;
-    
-    // Setup signal handling
-    if status_code == 0 {
-        // Setup handler to deal with specific signals
-        let handler = SigHandler::Handler(catch_signal);
-        let action = SigAction::new(handler, SaFlags::empty(), SigSet::empty());
-        
-        // Whitelisted signals
-        let signals: &[Signal] = &[Signal::SIGTERM, Signal::SIGALRM, Signal::SIGTSTP];
-        let mut unblock_set = SigSet::empty();
-        
-        // Add custom handler to select signals
-        for &sig in signals {
-            match unsafe { signal::sigaction(sig, &action) } {
-                Ok(prev) => {
-                    old_action = Some(prev);
-                }
-                
-                Err(e) => {
-                    eprintln!("failed to install SIGTERM handler: {}", e);
-                    status_code = 1;
-                    
-                    break;
-                }
-            }
-            
-            unblock_set.add(sig);
+
+    // Install signal handler
+    let handler = match SignalHandler::install(pid) {
+        Ok(handler) => handler,
+        Err(error) => {
+            eprintln!("failed to install signal handlers: {error}");
+            return 1;
         }
-        
-        if status_code == 0 {
-            // Whitelist our select signals
-            if let Err(e) = signal::pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&unblock_set), None) {
-                eprintln!("failed to unblock signals: {}", e);
-                status_code = 1;
-            }
-        }
-    }
-    
-    // Start watching the process
-    if status_code == 0 && proc >= 0 {
+    };
+
+    // Let the watcher deal with foreground changes when the child stops
+    let flags = WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
+
+    loop {
         match waitpid(pid, None) {
             Ok(WaitStatus::Exited(_, code)) => {
-                status_code = code as i32;
-                alive = false;
+                return code;
             }
             
-            Ok(WaitStatus::Signaled(_, sig, core)) => {
-                let sig_num: i32 = sig as i32;
-                status_code = sig_num + 128;
-                alive = false;
-                
-                println!("killed by {:?} ({}), core dumped: {}", sig, sig_num, core);
+            Ok(WaitStatus::Signaled(_, sig, _)) => {
+                return 128 + sig as i32;
             }
             
-            Ok(ws) => {
-                eprintln!("unexpected wait status: {:?}", ws);
-                status_code = 1;
+            Ok(WaitStatus::Stopped(_, sig)) => {
+                eprintln!("child stopped by {sig:?}");
+
+                /*
+                * Return terminal control and stop the supervisor.
+                * After the shell resumes, restore the child as the foreground group
+                * and wake the child process group.
+                */
+                handler.transfer_to_parent();
+                let _ = signal::raise(Signal::SIGSTOP);
+                handler.transfer_to_child();
+                let _ = signal::kill(Pid::from_raw(-pid.as_raw()), Signal::SIGCONT);
             }
-            
-            Err(_) => {
-                status_code = 1;
-                
-                // If we got interrupted by a signal and caught_signal is set,
-                // prefer the caught signal as exit cause.
-                let caught = CAUGHT_SIGNAL.load(Ordering::SeqCst);
-                
-                if caught != 0 {
-                    status_code = caught + 128;
-                }
+
+            Ok(WaitStatus::Continued(_)) | Ok(WaitStatus::StillAlive) => {
+                let _ = SignalHandler::forward_signal(pid);
+            }
+
+            Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {}
+
+            Err(Errno::EINTR) => {
+                let _ = SignalHandler::forward_signal(pid);
+            }
+
+            Err(Errno::ECHILD) => return 1,
+
+            Err(error) => {
+                eprintln!("waitpid failed: {error}");
+                return 1;
             }
         }
-        
-    } else if status_code == 0 {
-        status_code = 1;
-        
-        // No child: if we caught a signal, map it, otherwise default 1
-        let caught = CAUGHT_SIGNAL.load(Ordering::SeqCst);
-        
-        if caught != 0 {
-            status_code = caught + 128;
-        }
     }
-    
-    // Ask the process nicely to stop, then kill the damn thing
-    if status_code != 0 && alive {
-        let _ = signal::kill(pid, Signal::SIGTERM);
-        thread::sleep(Duration::from_secs(2));
-        let _ = signal::kill(pid, Signal::SIGKILL);
-    }
-    
-    // restore old SIGTERM handler if we saved it
-    if let Some(old) = old_action {
-        let _ = unsafe { signal::sigaction(Signal::SIGTERM, &old) };
-    }
-    
-    status_code
 }
 
 /**
  *
  */
 #[cfg(feature = "backend_scopex")]
-fn initgroups(username: &str, gid: gid_t) -> Result<NULL, std::io::Error> {
+fn initgroups(username: &str, gid: gid_t) -> Result<NULL, io::Error> {
     let c_user = CString::new(username).unwrap_or_else(|e| { errx!(1, "initgroups: {}\n\t{}", MSG_PARSE_CSTRING, e); });
     
     // SAFETY: initgroups reads /etc/group and sets supplementary group list.
@@ -224,7 +315,7 @@ fn initgroups(username: &str, gid: gid_t) -> Result<NULL, std::io::Error> {
     };
     
     if r != 0 {
-        return Err(std::io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
     }
     
     Ok(NULL)
