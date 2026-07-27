@@ -43,10 +43,7 @@ use std::panic::{
     catch_unwind
 };
 
-use crate::{
-    cstring,
-    errx
-};
+use crate::cstring;
     
 use std::{
     mem, 

@@ -47,11 +47,10 @@ use super::user::{
 
 cfg_if! {
     if #[cfg(feature = "backend_scopex")] {
-        use std::env;
-
         cfg_if! {
             if #[cfg(feature = "use_pam")] {
                 use crate::ffi::pam::PAM_CRED_INSUFFICIENT;
+                use std::env;
 
                 pub type AuthType = Result<Vec<String>, u32>;
 
@@ -107,6 +106,8 @@ cfg_if! {
 #[cfg(feature = "use_pam")]
 mod feat {
 
+    use cfg_if::cfg_if;
+
     use crate::shared::*;
     use crate::modules::passwd::ask_password;
     use crate::modules::user::Account;
@@ -120,12 +121,9 @@ mod feat {
     
     use crate::ffi::pam::{
         PAM_SUCCESS,
-        PAM_SYSTEM_ERR,
         PAM_NEW_AUTHTOK_REQD,
         PAM_CHANGE_EXPIRED_AUTHTOK
     };
-
-    use std::mem::ManuallyDrop;
     
     cfg_if! {
         if #[cfg(feature = "backend_scopex")] {
@@ -133,13 +131,18 @@ mod feat {
             use std::borrow::Cow;
             use std::os::unix::io::AsRawFd;
             use std::process;
-            use std::mem::drop;
             use std::io::{self, IsTerminal};
+
+            use std::mem::{
+                drop,
+                ManuallyDrop
+            };
             
             use crate::ffi::pam::{
                 PAM_TTY,
                 PAM_USER,
-                PAM_RUSER
+                PAM_RUSER,
+                PAM_SYSTEM_ERR
             };
             
             use nix::unistd::{
@@ -202,11 +205,18 @@ mod feat {
     ) -> AuthType {
     
         let mut conv = Conv {flags};
-        let mut pam_user = user.name();
-        
-        #[cfg(feature = "backend_scopex")]
-        if disable_auth {
-            pam_user = target.name();
+
+        cfg_if! {
+            if #[cfg(feature = "backend_scopex")] {
+                let pam_user = if disable_auth {
+                    target.name()
+                } else {
+                    user.name()
+                };
+
+            } else {
+                let pam_user = user.name();
+            }
         }
         
         match pam_start(env!("CARGO_PKG_NAME"), pam_user, &mut conv) {
@@ -265,7 +275,7 @@ mod feat {
                             match unsafe { fork() } {
                                 Ok(ForkResult::Child) => {
                                     // Create process group
-                                    setpgid(Pid::from_raw(0), Pid::from_raw(0));
+                                    let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
 
                                     // Child process, return and continue
                                     return Ok(pam_env);
@@ -336,7 +346,6 @@ mod feat {
     use std::time::UNIX_EPOCH;
 
     use crate::shared::*;
-    use crate::errx;
     use crate::modules::user::Account;
     use super::{
         AuthType,

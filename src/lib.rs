@@ -38,7 +38,6 @@ pub mod modules {
     pub mod path;
 }
 
-#[macro_use]
 extern crate cfg_if;
 
 #[cfg(all(feature = "backend_run0", feature = "backend_scopex"))]

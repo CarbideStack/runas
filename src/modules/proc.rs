@@ -22,6 +22,7 @@ use cfg_if::cfg_if;
 use crate::errx;
 use super::user::Account;
 use std::ffi::CString;
+use std::convert::Infallible;
 
 use nix::unistd::{
     setgroups, 
@@ -37,13 +38,8 @@ cfg_if! {
         use nix::errno::Errno;
         use std::os::unix::ffi::OsStrExt;
         use std::os::fd::AsRawFd;
-        use std::time::Duration;
         use std::io;
-
-        use std::{
-            thread,
-            env
-        };
+        use std::env;
         
         use std::os::raw::{
             c_char,
@@ -61,8 +57,7 @@ cfg_if! {
             SigSet,
             SigHandler,
             SigAction,
-            SaFlags,
-            SigmaskHow
+            SaFlags
         };
         
         use nix::sys::wait::{
@@ -258,7 +253,7 @@ pub fn watch_process(pid: Pid) -> i32 {
     let flags = WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
 
     loop {
-        match waitpid(pid, None) {
+        match waitpid(pid, Some(flags)) {
             Ok(WaitStatus::Exited(_, code)) => {
                 return code;
             }
@@ -331,7 +326,7 @@ pub fn exec(
     argv: &[CString], 
     #[cfg(feature = "backend_scopex")] envp: &[CString],
     #[cfg(feature = "backend_scopex")] cwd: &Option<String>
-) {
+) -> Infallible {
 
     cfg_if! {
         if #[cfg(feature = "backend_scopex")] {
@@ -372,7 +367,7 @@ pub fn exec(
                 }
             }
             
-            execve(&cmd_path, argv, envp).expect("Failed to spawn process");
+            execve(&cmd_path, argv, envp).expect("Failed to spawn process")
         
         } else {
             let root_gid = Gid::from_raw(0);
@@ -388,7 +383,7 @@ pub fn exec(
                 errx!(1, "Failed to raise user privileges");
             }
         
-            execvp(cmd, argv).expect("Failed to spawn process");
+            execvp(cmd, argv).expect("Failed to spawn process")
         }
     }
 }

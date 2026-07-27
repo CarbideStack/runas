@@ -53,6 +53,7 @@ use runas::modules::proc::exec;
 use std::env;
 use std::ffi::CString;
 use std::fs::File;
+use std::convert::Infallible;
 
 use std::io::{
     BufRead, 
@@ -364,7 +365,7 @@ pub fn build_environment(
  *
  * Exits immediately on error via `errx!()`.
  */
-fn main() {
+fn main() -> Infallible {
     cfg_if! {
         if #[cfg(feature = "backend_scopex")] {
             let mut envp:     Vec<CString>   = vec![cstring!("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")];
@@ -426,7 +427,7 @@ fn main() {
             match *cli_opt {
                 OPT_HELP => {
                     print_usage(&argv_in[0], &argv_opt);
-                    return;
+                    std::process::exit(0);
                 }
                 
                 OPT_USER => {
@@ -489,7 +490,7 @@ fn main() {
                         }
                     }
 
-                    return;
+                    std::process::exit(0);
                 }
                 
                 OPT_ENV => {
@@ -731,7 +732,7 @@ fn main() {
                 );
             
                 // Launch the process
-                exec(&user, &target, &argv_out[0], &argv_out[1..], &envp, &chdir);
+                return exec(&user, &target, &argv_out[0], &argv_out[1..], &envp, &chdir);
             
             } else {
                 // Load override variables
@@ -744,13 +745,13 @@ fn main() {
                 );
                 
                 // Launch Systemd
-                exec(&user, &argv_out[0], &argv_out[1..]);
+                return exec(&user, &argv_out[0], &argv_out[1..]);
             }
         }
         
         // We should never reach this point
     }
 
-    errx!(1, "Authentication failed");
+    errx!(1, "Authentication failed")
 }
 
