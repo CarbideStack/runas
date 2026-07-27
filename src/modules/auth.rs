@@ -46,31 +46,33 @@ use super::user::{
 };
 
 cfg_if! {
-    if #[cfg(not(feature = "use_pam"))] {
-        pub type AuthType = bool;
-        const DEFAULT_TRUE: AuthType = true;
-        const DEFAULT_FALSE: AuthType = false;
-        
-        impl TypeCheck for AuthType {
-            #[inline]
-            fn is_true(&self) -> bool { *self }
-        }
-        
-    } else if #[cfg(feature = "backend_scopex")] {
-        use crate::ffi::pam::PAM_CRED_INSUFFICIENT;
+    if #[cfg(feature = "backend_scopex")] {
         use std::env;
-        
-        pub type AuthType = Result<Vec<String>, u32>;
+
+        cfg_if! {
+            if #[cfg(feature = "use_pam")] {
+                use crate::ffi::pam::PAM_CRED_INSUFFICIENT;
+
+                pub type AuthType = Result<Vec<String>, u32>;
+
+                #[allow(dead_code)]
+                const DEFAULT_FALSE: AuthType = Err(PAM_CRED_INSUFFICIENT);
+
+            } else {
+                pub type AuthType = Result<Vec<String>, ()>;
+                const DEFAULT_FALSE: AuthType = Err(());
+            }
+        }
+
         #[allow(dead_code)]
         const DEFAULT_TRUE: AuthType = Ok(Vec::new());
-        const DEFAULT_FALSE: AuthType = Err(PAM_CRED_INSUFFICIENT);
         
         impl TypeCheck for AuthType {
             #[inline]
             fn is_true(&self) -> bool { self.is_ok() }
         }
-        
-    } else {
+
+    } else if #[cfg(feature = "use_pam")] {
         use crate::ffi::pam::{
             PAM_SUCCESS,
             PAM_AUTH_ERR
@@ -83,6 +85,16 @@ cfg_if! {
         impl TypeCheck for AuthType {
             #[inline]
             fn is_true(&self) -> bool { *self == PAM_SUCCESS }
+        }
+        
+    } else {
+        pub type AuthType = bool;
+        const DEFAULT_TRUE: AuthType = true;
+        const DEFAULT_FALSE: AuthType = false;
+        
+        impl TypeCheck for AuthType {
+            #[inline]
+            fn is_true(&self) -> bool { *self }
         }
     }
 }
@@ -326,6 +338,11 @@ mod feat {
     use crate::shared::*;
     use crate::errx;
     use crate::modules::user::Account;
+    use super::{
+        AuthType,
+        DEFAULT_FALSE,
+        DEFAULT_TRUE
+    };
     
     use crate::modules::passwd::{
         ask_password, 
@@ -340,7 +357,7 @@ mod feat {
     /**
      * Shadow-file authentication backend.
      */
-    pub fn auth(user: &Account, flags: RunFlags) -> bool {
+    pub fn auth(user: &Account, flags: RunFlags) -> AuthType {
         if let Some(entry) = getspnam(user.name()) {
             let today = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -348,12 +365,12 @@ mod feat {
                 .unwrap_or(i64::MAX);
 
             let passwd_expiry = if entry.last_change == 0 {
-                return false // Password change required
+                return DEFAULT_FALSE // Password change required
 
             } else if entry.last_change > 0 && entry.max_age >= 0 {
                 match entry.last_change.checked_add(entry.max_age) {
                     Some(expiry) => Some(expiry),
-                    None => return false, // Invalid shadow data
+                    None => return DEFAULT_FALSE, // Invalid shadow data
                 }
 
             } else {
@@ -368,20 +385,22 @@ mod feat {
                     .is_some_and(|expiry| today > expiry);
 
             if accnt_expired || passwd_expired || inactive {
-                return false;
+                return DEFAULT_FALSE;
             }
 
             let pwd = ask_password(PROMPT_TEXT, flags | RunFlags::PROMPT_HIDE);
             
             if let Some(user_hash) = crypt(pwd, &entry.passwd_hash) {
-                return time_compare(&user_hash, &entry.passwd_hash);
+                if time_compare(&user_hash, &entry.passwd_hash) {
+                    return DEFAULT_TRUE
+                }
             }
             
         } else {
-            errx!(1, "auth: {}", MSG_IO_USER_DB);
+            eprintln!("auth: {}", MSG_IO_USER_DB);
         }
     
-        false
+        DEFAULT_FALSE
     }
 }
 
