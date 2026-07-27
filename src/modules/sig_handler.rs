@@ -71,7 +71,7 @@ extern "C" fn catch_signal(signum: c_int) {
 /**
  * 
  */
-pub struct SignalHandler {
+pub(crate) struct SignalHandler {
     actions: Vec<(Signal, SigAction)>,
     foreground_group: Option<(i32, Pid, Pid)>,
 }
@@ -80,7 +80,7 @@ impl SignalHandler {
     /**
      * 
      */
-    pub fn forward_signal(group: Pid) -> Option<Signal> {
+    pub(crate) fn forward_signal(group: Pid) -> Option<Signal> {
         let raw = CAUGHT_SIGNAL.swap(0, Ordering::SeqCst);
         let caught = Signal::try_from(raw).ok()?;
 
@@ -94,7 +94,7 @@ impl SignalHandler {
     /**
      * 
      */
-    pub fn install(child: Pid) -> nix::Result<Self> {
+    pub(crate) fn install(child: Pid) -> nix::Result<Self> {
         let action = SigAction::new(
             SigHandler::Handler(catch_signal),
             SaFlags::empty(),
@@ -152,7 +152,7 @@ impl SignalHandler {
     /**
      * 
      */
-    pub fn transfer_to_parent(&self) {
+    pub(crate) fn transfer_to_parent(&self) {
         if let Some((terminal, original, _)) = self.foreground_group {
             let _ = tcsetpgrp(terminal, original);
         }
@@ -161,7 +161,7 @@ impl SignalHandler {
     /**
      * 
      */
-    pub fn transfer_to_child(&self) {
+    pub(crate) fn transfer_to_child(&self) {
         if let Some((terminal, _, child)) = self.foreground_group {
             let _ = tcsetpgrp(terminal, child);
         }

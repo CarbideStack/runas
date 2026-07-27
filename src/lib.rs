@@ -30,18 +30,18 @@ mod ffi {
 
 pub mod modules {
     pub mod user;
-    pub mod passwd;
+    pub(crate) mod passwd;
     pub mod auth;
     pub mod proc;
     
     #[cfg(feature = "backend_scopex")]
-    pub mod path;
+    pub(crate) mod path;
 
     #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-    pub mod fork_sync;
+    pub(crate) mod fork_sync;
 
     #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-    pub mod sig_handler;
+    pub(crate) mod sig_handler;
 }
 
 extern crate cfg_if;
@@ -54,4 +54,3 @@ compile_error!("The feature 'without_expand_env' does not work with the 'backend
 
 #[cfg(all(feature = "backend_scopex", feature = "without_expand_env"))]
 compile_error!("The feature 'without_expand_env' does not work with the 'backend_scopex' feature");
-

@@ -36,7 +36,7 @@ use std::path::{
 /**
  *
  */
-pub fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<PathBuf> {
+pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<PathBuf> {
     let path = Path::new(cmd);
 
     // Case 1: already absolute

@@ -78,7 +78,7 @@ cfg_if! {
  *
  */
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-pub fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
+pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
 
     // Create the process group
     if setpgid(pid, pid).is_err() {
@@ -236,4 +236,3 @@ pub fn exec(
         }
     }
 }
-

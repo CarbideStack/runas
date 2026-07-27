@@ -202,7 +202,7 @@ mod feat {
      * Uses the system PAM stack to authenticate a user interactively
      * through a conversation handler.
      */
-    pub fn auth(
+    pub(crate) fn auth(
             user: &Account, 
             #[cfg(feature = "backend_scopex")] target: &Account, 
             flags: RunFlags,
@@ -393,7 +393,7 @@ mod feat {
     /**
      * Shadow-file authentication backend.
      */
-    pub fn auth(user: &Account, flags: RunFlags) -> AuthType {
+    pub(crate) fn auth(user: &Account, flags: RunFlags) -> AuthType {
         if let Some(entry) = getspnam(user.name()) {
             let today = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -444,7 +444,7 @@ mod feat {
  *
  */
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-pub fn get_envp() -> Vec<String> {
+pub(crate) fn get_envp() -> Vec<String> {
     env::vars()
         .map(|(key, value)| format!("{key}={value}"))
         .collect()
@@ -523,4 +523,3 @@ pub fn authenticate(user: &Account, target: &Account, flags: RunFlags) -> AuthTy
      */
     DEFAULT_FALSE
 }
-

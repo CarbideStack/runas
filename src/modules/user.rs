@@ -63,7 +63,7 @@ pub struct Group {
 /**
  * Represents a system user, including name, UID, and primary group ID.
  */
-pub struct User {
+pub(crate) struct User {
     pub(in self) uid: C_Uid,
     pub(in self) gid: C_Gid,
     pub(in self) name: String,
@@ -83,36 +83,37 @@ pub struct Account {
 /**
  *
  */
+#[allow(dead_code)]
 impl User {
     /**
      *
      */
-    pub fn is_root(&self) -> bool { self.uid.is_root() }
+    pub(crate) fn is_root(&self) -> bool { self.uid.is_root() }
 
     /**
      * Return the user shell
      */
-    pub fn shell(&self) -> &str { &self.shell }
+    pub(crate) fn shell(&self) -> &str { &self.shell }
 
     /**
      * Return the user home dir
      */
-    pub fn home(&self) -> &str { &self.home }
+    pub(crate) fn home(&self) -> &str { &self.home }
 
     /**
      * Return the user name
      */
-    pub fn name(&self) -> &str { &self.name }
+    pub(crate) fn name(&self) -> &str { &self.name }
     
     /**
      * Return the user ID
      */
-    pub fn uid(&self) -> C_Uid { self.uid }
+    pub(crate) fn uid(&self) -> C_Uid { self.uid }
     
     /**
      * Return the user primary group ID
      */
-    pub fn gid(&self) -> C_Gid { self.gid }
+    pub(crate) fn gid(&self) -> C_Gid { self.gid }
 
     /**
      * Create a user from a name or UID string.
@@ -122,7 +123,7 @@ impl User {
      *
      * Aborts the process with `errx!()` if the system user database cannot be queried.
      */
-    pub fn from(user: &str) -> Option<Self> {
+    pub(crate) fn from(user: &str) -> Option<Self> {
         let mut uinfo: Option<C_User>;
 
         if let Some(rest) = user.strip_prefix('#') {
@@ -183,7 +184,7 @@ impl Group {
     /**
      * Return the user primary group ID
      */
-    pub fn gid(&self) -> C_Gid { self.gid }
+    pub(crate) fn gid(&self) -> C_Gid { self.gid }
     
     /**
      * Create a group from a name or GID string.
@@ -237,7 +238,7 @@ impl Account {
     /**
      *
      */
-    pub fn is_root(&self) -> bool { self.user.uid.is_root() }
+    pub(crate) fn is_root(&self) -> bool { self.user.uid.is_root() }
 
     /**
      * Return the user shell
@@ -267,7 +268,8 @@ impl Account {
     /**
      * Return the user object
      */
-    pub fn user(&self) -> &User { &self.user }
+    #[allow(dead_code)]
+    pub(crate) fn user(&self) -> &User { &self.user }
     
     /**
      * Return the group object
@@ -277,7 +279,8 @@ impl Account {
     /**
      *
      */
-    pub fn set_user(&mut self, user: User) {
+    #[allow(dead_code)]
+    pub(crate) fn set_user(&mut self, user: User) {
         self.user = user;
     }
     
@@ -320,7 +323,7 @@ impl Account {
     /**
      * Get a list of all Gid's that this account is a member of.
      */
-    pub fn group_list(&self) -> Ref<'_, Vec<C_Gid>> {
+    pub(crate) fn group_list(&self) -> Ref<'_, Vec<C_Gid>> {
         if self.group_list.borrow().is_none() {
             let username = CString::new(self.user.name.as_str())
                 .unwrap_or_else(|_| {
@@ -346,7 +349,7 @@ impl Account {
     /**
      * Check whether this account is a member of the specified group.
      */
-    pub fn is_member(&self, group: &Group) -> bool {
+    pub(crate) fn is_member(&self, group: &Group) -> bool {
         // Root belongs to everything
         if self.user.uid.is_root() {
             return true;
@@ -363,4 +366,3 @@ impl Account {
         false
     }
 }
-

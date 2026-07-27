@@ -450,7 +450,8 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
  *
  * Returns `true` if both strings are identical, `false` otherwise.
  */
-pub fn time_compare(known: &str, secret: &str) -> bool {
+#[cfg(not(feature = "use_pam"))]
+pub(crate) fn time_compare(known: &str, secret: &str) -> bool {
     let     buff_known:  &[u8]   = known.as_bytes();
     let     buff_secret: &[u8]   = secret.as_bytes();
     let     known_len:   usize   = buff_known.len();
@@ -500,7 +501,7 @@ pub fn time_compare(known: &str, secret: &str) -> bool {
  * The password input as a `String`. On fatal I/O or UTF-8 conversion errors,
  * the process terminates via `errx!()`.
  */
-pub fn ask_password(msg: &str, flags: RunFlags) -> String {
+pub(crate) fn ask_password(msg: &str, flags: RunFlags) -> String {
     loop {
         match launch_prompt(msg, flags) {
             Ok(password) => return password,

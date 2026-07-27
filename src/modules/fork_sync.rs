@@ -108,7 +108,7 @@ impl Drop for Descriptor {
  * The result of waiting for the other side of the fork.
  */
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SyncDecision {
+pub(crate) enum SyncDecision {
     Continue,
     Abort,
 }
@@ -119,7 +119,7 @@ pub enum SyncDecision {
  * Consume this value with into_child() in the child and into_parent() in the
  * parent. Each method closes the endpoints belonging to the other side.
  */
-pub struct ForkSync {
+pub(crate) struct ForkSync {
     child_write: Option<Descriptor>,
     child_read: Option<Descriptor>,
     parent_write: Option<Descriptor>,
@@ -130,7 +130,7 @@ impl ForkSync {
     /**
      * Create a new synchronization pair.
      */
-    pub fn new() -> nix::Result<Self> {
+    pub(crate) fn new() -> nix::Result<Self> {
         let (parent_read, child_write) = Descriptor::pipe()?;
         let (child_read, parent_write) = Descriptor::pipe()?;
 
@@ -145,7 +145,7 @@ impl ForkSync {
     /**
      * Convert the inherited endpoints into the child side.
      */
-    pub fn into_child(mut self) -> ForkEndpoint {
+    pub(crate) fn into_child(mut self) -> ForkEndpoint {
         drop(self.parent_read.take());
         drop(self.parent_write.take());
 
@@ -159,7 +159,7 @@ impl ForkSync {
     /**
      * Convert the inherited endpoints into the parent side.
      */
-    pub fn into_parent(mut self) -> ForkEndpoint {
+    pub(crate) fn into_parent(mut self) -> ForkEndpoint {
         drop(self.child_write.take());
         drop(self.child_read.take());
 
@@ -174,7 +174,7 @@ impl ForkSync {
 /**
  * One side of the fork synchronization barrier.
  */
-pub struct ForkEndpoint {
+pub(crate) struct ForkEndpoint {
     write: Option<Descriptor>,
     read: Option<Descriptor>,
     status_sent: bool,
@@ -184,7 +184,7 @@ impl ForkEndpoint {
     /**
      * Report successful initialization and wait for the peer.
      */
-    pub fn ready_and_wait(mut self) -> nix::Result<SyncDecision> {
+    pub(crate) fn ready_and_wait(mut self) -> nix::Result<SyncDecision> {
         self.send_status(STATUS_READY)?;
 
         let decision = match self.read.as_ref().ok_or(Errno::EBADF)?.read_byte()? {
@@ -203,7 +203,8 @@ impl ForkEndpoint {
      * The caller decides how its side should terminate after reporting the
      * failure. Dropping this endpoint closes all remaining descriptors.
      */
-    pub fn report_failure(mut self) -> nix::Result<()> {
+    #[allow(dead_code)]
+    pub(crate) fn report_failure(mut self) -> nix::Result<()> {
         self.send_status(STATUS_FAILED)
     }
 
