@@ -17,7 +17,6 @@ nix = { version = "0.26", default-features = false, features = [
 ] }
 getopts = "0.2"
 bitflags = "2.5"
-atty = "0.2"
 cfg-if = "1"
 zeroize = "1.5"
 

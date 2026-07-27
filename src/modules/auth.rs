@@ -122,6 +122,7 @@ mod feat {
             use std::os::unix::io::AsRawFd;
             use std::process;
             use std::mem::drop;
+            use std::io::{self, IsTerminal};
             
             use crate::ffi::pam::{
                 PAM_TTY,
@@ -130,7 +131,6 @@ mod feat {
             };
             
             use nix::unistd::{
-                isatty, 
                 ttyname,
                 fork,
                 ForkResult,
@@ -202,9 +202,10 @@ mod feat {
                 cfg_if! {
                     if #[cfg(feature = "backend_scopex")] {
                         let mut result = PAM_SUCCESS;
-                        let fd: i32 = std::io::stdin().as_raw_fd();
-                        
-                        if let Ok(status) = isatty(fd) {
+
+                        if io::stdin().is_terminal() {
+                            let fd: i32 = io::stdin().as_raw_fd();
+
                             if let Ok(tty_path) = ttyname(fd) {
                                 let tty: Cow<'_, str> = tty_path.as_os_str().to_string_lossy();
                                 let _ = handle.set_item(PAM_TTY, &tty);

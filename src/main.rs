@@ -80,7 +80,7 @@ use getopts::{
 };
 
 #[cfg(not(feature = "backend_scopex"))]
-use atty::Stream;
+use std::io::IsTerminal;
 
 cfg_if! {
     if #[cfg(feature = "backend_run0")] {
@@ -670,12 +670,11 @@ fn main() {
                 }
             
             } else {
-                if atty::is(Stream::Stdout) 
-                        && atty::is(Stream::Stderr) 
-                        && atty::is(Stream::Stdin) {
-                
+                if std::io::stdout().is_terminal()
+                        && std::io::stderr().is_terminal()
+                        && std::io::stdin().is_terminal()
+                {
                     argv_out.push(cstring!("--pty"));
-                    
                 } else {
                     argv_out.push(cstring!("--pipe"));
                 }
