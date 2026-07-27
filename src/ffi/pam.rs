@@ -44,7 +44,6 @@ use std::panic::{
 };
 
 use crate::{
-    unwrap,
     cstring,
     errx
 };
