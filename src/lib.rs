@@ -37,7 +37,7 @@ pub mod modules {
     #[cfg(feature = "backend_scopex")]
     pub mod path;
 
-    #[cfg(feature = "backend_scopex")]
+    #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
     pub mod fork_sync;
 }
 

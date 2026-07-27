@@ -32,49 +32,51 @@ use nix::unistd::{
 
 cfg_if! {
     if #[cfg(feature = "backend_scopex")] {
+        cfg_if! {
+            if #[cfg(feature = "use_pam")] {
+                use super::fork_sync::ForkEndpoint;
+                use nix::errno::Errno;
+                use std::os::fd::AsRawFd;
+                use std::os::raw::c_int;
+
+                use std::sync::atomic::{
+                    AtomicI32, 
+                    Ordering
+                };
+
+                use nix::sys::wait::{
+                    waitpid,
+                    WaitStatus,
+                    WaitPidFlag
+                };
+
+                use nix::unistd::{
+                    setpgid,
+                    tcgetpgrp,
+                    tcsetpgrp,
+                    Pid
+                };
+
+                use nix::sys::signal::{
+                    self, 
+                    Signal,
+                    SigSet,
+                    SigHandler,
+                    SigAction,
+                    SaFlags
+                };
+            }
+        }
+
         use crate::shared::*;
         use super::path::find_executable;
-        use super::fork_sync::ForkEndpoint;
         use nix::libc::gid_t;
-        use nix::errno::Errno;
         use std::os::unix::ffi::OsStrExt;
-        use std::os::fd::AsRawFd;
         use std::io;
         use std::env;
-
-        use std::os::raw::{
-            c_char,
-            c_int
-        };
+        use std::os::raw::c_char;
+        use nix::unistd::execve;
         
-        use std::sync::atomic::{
-            AtomicI32, 
-            Ordering
-        };
-        
-        use nix::sys::signal::{
-            self, 
-            Signal,
-            SigSet,
-            SigHandler,
-            SigAction,
-            SaFlags
-        };
-        
-        use nix::sys::wait::{
-            waitpid,
-            WaitStatus,
-            WaitPidFlag
-        };
-        
-        use nix::unistd::{
-            setpgid,
-            tcgetpgrp,
-            tcsetpgrp,
-            execve,
-            Pid
-        };
-    
     } else {
         use nix::unistd::{
             execvp, 
@@ -87,13 +89,13 @@ cfg_if! {
 /**
  *
  */
-#[cfg(feature = "backend_scopex")]
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 static CAUGHT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 /**
  *
  */
-#[cfg(feature = "backend_scopex")]
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 const FORWARDED_SIGNALS: &[Signal] = &[
     Signal::SIGHUP,
     Signal::SIGINT,
@@ -108,7 +110,7 @@ const FORWARDED_SIGNALS: &[Signal] = &[
 /**
  *
  */
-#[cfg(feature = "backend_scopex")]
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 extern "C" fn catch_signal(signum: c_int) {
     CAUGHT_SIGNAL.store(signum, Ordering::SeqCst);
 }
@@ -116,13 +118,13 @@ extern "C" fn catch_signal(signum: c_int) {
 /**
  * 
  */
-#[cfg(feature = "backend_scopex")]
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 struct SignalHandler {
     actions: Vec<(Signal, SigAction)>,
     foreground_group: Option<(i32, Pid, Pid)>,
 }
 
-#[cfg(feature = "backend_scopex")]
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 impl SignalHandler {
     /**
      * 
@@ -215,7 +217,7 @@ impl SignalHandler {
     }
 }
 
-#[cfg(feature = "backend_scopex")]
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 impl Drop for SignalHandler {
     /**
      * 
@@ -232,7 +234,7 @@ impl Drop for SignalHandler {
 /**
  *
  */
-#[cfg(feature = "backend_scopex")]
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 pub fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
 
     // Create the process group
