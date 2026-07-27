@@ -39,6 +39,9 @@ pub mod modules {
 
     #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
     pub mod fork_sync;
+
+    #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+    pub mod sig_handler;
 }
 
 extern crate cfg_if;

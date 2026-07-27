@@ -34,15 +34,9 @@ cfg_if! {
     if #[cfg(feature = "backend_scopex")] {
         cfg_if! {
             if #[cfg(feature = "use_pam")] {
+                use super::sig_handler::SignalHandler;
                 use super::fork_sync::ForkEndpoint;
                 use nix::errno::Errno;
-                use std::os::fd::AsRawFd;
-                use std::os::raw::c_int;
-
-                use std::sync::atomic::{
-                    AtomicI32, 
-                    Ordering
-                };
 
                 use nix::sys::wait::{
                     waitpid,
@@ -52,18 +46,12 @@ cfg_if! {
 
                 use nix::unistd::{
                     setpgid,
-                    tcgetpgrp,
-                    tcsetpgrp,
                     Pid
                 };
 
                 use nix::sys::signal::{
                     self, 
-                    Signal,
-                    SigSet,
-                    SigHandler,
-                    SigAction,
-                    SaFlags
+                    Signal
                 };
             }
         }
@@ -83,151 +71,6 @@ cfg_if! {
             Gid, 
             Uid
         };
-    }
-}
-
-/**
- *
- */
-#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-static CAUGHT_SIGNAL: AtomicI32 = AtomicI32::new(0);
-
-/**
- *
- */
-#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-const FORWARDED_SIGNALS: &[Signal] = &[
-    Signal::SIGHUP,
-    Signal::SIGINT,
-    Signal::SIGQUIT,
-    Signal::SIGTERM,
-    Signal::SIGALRM,
-    Signal::SIGTSTP,
-    Signal::SIGCONT,
-    Signal::SIGWINCH,
-];
-
-/**
- *
- */
-#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-extern "C" fn catch_signal(signum: c_int) {
-    CAUGHT_SIGNAL.store(signum, Ordering::SeqCst);
-}
-
-/**
- * 
- */
-#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-struct SignalHandler {
-    actions: Vec<(Signal, SigAction)>,
-    foreground_group: Option<(i32, Pid, Pid)>,
-}
-
-#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-impl SignalHandler {
-    /**
-     * 
-     */
-    fn forward_signal(group: Pid) -> Option<Signal> {
-        let raw = CAUGHT_SIGNAL.swap(0, Ordering::SeqCst);
-        let caught = Signal::try_from(raw).ok()?;
-
-        /*
-        * kill() with a negative PID addresses the entire child process group.
-        */
-        let _ = signal::kill(Pid::from_raw(-group.as_raw()), caught);
-        Some(caught)
-    }
-
-    /**
-     * 
-     */
-    fn install(child: Pid) -> nix::Result<Self> {
-        let action = SigAction::new(
-            SigHandler::Handler(catch_signal),
-            SaFlags::empty(),
-            SigSet::empty(),
-        );
-        let mut actions = Vec::with_capacity(FORWARDED_SIGNALS.len());
-
-        for &sig in FORWARDED_SIGNALS {
-            match unsafe { signal::sigaction(sig, &action) } {
-                Ok(prev) => actions.push((sig, prev)),
-
-                Err(e) => {
-                    for (sig, prev) in actions.into_iter().rev() {
-                        let _ = unsafe { signal::sigaction(sig, &prev) };
-                    }
-
-                    return Err(e);
-                }
-            }
-        }
-
-        /*
-         * A background supervisor must ignore SIGTTOU while transferring
-         * terminal ownership to and from the child process group.
-         */
-        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-        match unsafe { signal::sigaction(Signal::SIGTTOU, &ignore) } {
-            Ok(prev) => actions.push((Signal::SIGTTOU, prev)),
-            Err(error) => {
-                for (sig, prev) in actions.into_iter().rev() {
-                    let _ = unsafe { signal::sigaction(sig, &prev) };
-                }
-
-                return Err(error);
-            }
-        }
-
-        /*
-         * Give the child process group control of the terminal. Ignore errors
-         * when stdin is not a controlling terminal.
-         */
-        let terminal = io::stdin().as_raw_fd();
-        let foreground_group = tcgetpgrp(terminal).ok().and_then(|original| {
-            tcsetpgrp(terminal, child)
-                .ok()
-                .map(|_| (terminal, original, child))
-        });
-
-        Ok(Self {
-            actions,
-            foreground_group,
-        })
-    }
-
-    /**
-     * 
-     */
-    fn transfer_to_parent(&self) {
-        if let Some((terminal, original, _)) = self.foreground_group {
-            let _ = tcsetpgrp(terminal, original);
-        }
-    }
-
-    /**
-     * 
-     */
-    fn transfer_to_child(&self) {
-        if let Some((terminal, _, child)) = self.foreground_group {
-            let _ = tcsetpgrp(terminal, child);
-        }
-    }
-}
-
-#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-impl Drop for SignalHandler {
-    /**
-     * 
-     */
-    fn drop(&mut self) {
-        self.transfer_to_parent();
-
-        for &(sig, ref prev) in self.actions.iter().rev() {
-            let _ = unsafe { signal::sigaction(sig, prev) };
-        }
     }
 }
 
