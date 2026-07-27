@@ -34,13 +34,14 @@ cfg_if! {
     if #[cfg(feature = "backend_scopex")] {
         use crate::shared::*;
         use super::path::find_executable;
+        use super::fork_sync::ForkEndpoint;
         use nix::libc::gid_t;
         use nix::errno::Errno;
         use std::os::unix::ffi::OsStrExt;
         use std::os::fd::AsRawFd;
         use std::io;
         use std::env;
-        
+
         use std::os::raw::{
             c_char,
             c_int
@@ -232,7 +233,7 @@ impl Drop for SignalHandler {
  *
  */
 #[cfg(feature = "backend_scopex")]
-pub fn watch_process(pid: Pid) -> i32 {
+pub fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
 
     // Create the process group
     if setpgid(pid, pid).is_err() {
@@ -248,6 +249,9 @@ pub fn watch_process(pid: Pid) -> i32 {
             return 1;
         }
     };
+
+    // Notify the child process that we are ready on this side
+    let _ = pipe.ready_and_wait();
 
     // Let the watcher deal with foreground changes when the child stops
     let flags = WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;

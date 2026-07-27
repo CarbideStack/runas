@@ -36,6 +36,9 @@ pub mod modules {
     
     #[cfg(feature = "backend_scopex")]
     pub mod path;
+
+    #[cfg(feature = "backend_scopex")]
+    pub mod fork_sync;
 }
 
 extern crate cfg_if;

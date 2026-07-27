@@ -133,6 +133,11 @@ mod feat {
             use std::process;
             use std::io::{self, IsTerminal};
 
+            use crate::modules::fork_sync::{
+                ForkSync,
+                SyncDecision
+            };
+
             use std::mem::{
                 drop,
                 ManuallyDrop
@@ -269,21 +274,43 @@ mod feat {
                         }
                     
                         if result == PAM_SUCCESS {
+                            let sync = match ForkSync::new() {
+                                Ok(sync) => sync,
+                                Err(err) => {
+                                    eprintln!("fork failed: {}", err);
+                                    return Err(PAM_SYSTEM_ERR);
+                                }
+                            };
                             let pam_env = handle.getenvlist();
                             let handle = ManuallyDrop::new(handle);
 
                             match unsafe { fork() } {
                                 Ok(ForkResult::Child) => {
-                                    // Create process group
-                                    let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+                                    let pipe = sync.into_child();
 
-                                    // Child process, return and continue
+                                    // Create process group
+                                    if let Err(err) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+                                        eprintln!("fork failed: {}", err);
+                                        return Err(PAM_SYSTEM_ERR);
+                                    }
+
+                                    // Notify the parent that we are ready to continue
+                                    let ready = pipe.ready_and_wait();
+
+                                    /* The parent failed. We will not continue without
+                                     * parent supervision.
+                                     */
+                                    if ready != Ok(SyncDecision::Continue) {
+                                        return Err(PAM_SYSTEM_ERR);
+                                    }
+
+                                    // Everything succeded. Let's get this process running.
                                     return Ok(pam_env);
                                 }
                                 
                                 Ok(ForkResult::Parent { child }) => {
                                     // Wait for the process and keep PAM session alive
-                                    let status_code: i32 = watch_process(child);
+                                    let status_code: i32 = watch_process(child, sync.into_parent());
                                     
                                     // Ensure that PAM has a chance to quit before terminating
                                     drop(ManuallyDrop::into_inner(handle));
