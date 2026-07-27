@@ -34,9 +34,11 @@ cfg_if! {
     if #[cfg(feature = "backend_scopex")] {
         cfg_if! {
             if #[cfg(feature = "use_pam")] {
-                use super::sig_handler::SignalHandler;
+                use super::signal_recv::SignalReceiver;
                 use super::fork_sync::ForkEndpoint;
+                use super::fg_handler::ForegroundHandler;
                 use nix::errno::Errno;
+                use nix::libc;
 
                 use nix::sys::wait::{
                     waitpid,
@@ -45,6 +47,7 @@ cfg_if! {
                 };
 
                 use nix::unistd::{
+                    getppid,
                     setpgid,
                     Pid
                 };
@@ -75,10 +78,42 @@ cfg_if! {
 }
 
 /**
+ * 
+ */
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+const RECEIVED_SIGNALS: &[Signal] = &[
+    Signal::SIGCHLD,
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGQUIT,
+    Signal::SIGTERM,
+    Signal::SIGALRM,
+    Signal::SIGTSTP,
+    Signal::SIGCONT,
+    Signal::SIGWINCH,
+];
+
+/**
  *
  */
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
+
+    let mut signals = match SignalReceiver::install(RECEIVED_SIGNALS.iter().copied()) {
+        Ok(receiver) => receiver,
+        Err(error) => {
+            eprintln!("failed to create signal receiver: {error}");
+            return 1;
+        }
+    };
+
+    let handler = match ForegroundHandler::install(pid) {
+        Ok(handler) => handler,
+        Err(error) => {
+            eprintln!("failed to create foreground handler: {error}");
+            return 1;
+        }
+    };
 
     // Create the process group
     if setpgid(pid, pid).is_err() {
@@ -86,63 +121,93 @@ pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
         return 1;
     }
 
-    // Install signal handler
-    let handler = match SignalHandler::install(pid) {
-        Ok(handler) => handler,
-        Err(error) => {
-            eprintln!("failed to install signal handlers: {error}");
-            return 1;
-        }
-    };
-
     // Notify the child process that we are ready on this side
     let _ = pipe.ready_and_wait();
 
     // Let the watcher deal with foreground changes when the child stops
-    let flags = WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED;
+    let flags = WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED | WaitPidFlag::WNOHANG;
+
+    //
+    let mut initiate = true;
 
     loop {
-        match waitpid(pid, Some(flags)) {
-            Ok(WaitStatus::Exited(_, code)) => {
-                return code;
-            }
-            
-            Ok(WaitStatus::Signaled(_, sig, _)) => {
-                return 128 + sig as i32;
-            }
-            
-            Ok(WaitStatus::Stopped(_, sig)) => {
-                eprintln!("child stopped by {sig:?}");
+        let signal = if initiate {
+            initiate = false;
+            Signal::SIGCHLD
 
-                /*
-                * Return terminal control and stop the supervisor.
-                * After the shell resumes, restore the child as the foreground group
-                * and wake the child process group.
-                */
-                handler.transfer_to_parent();
-                let _ = signal::raise(Signal::SIGSTOP);
-                handler.transfer_to_child();
-                let _ = signal::kill(Pid::from_raw(-pid.as_raw()), Signal::SIGCONT);
+        } else {
+            let event = match signals.wait() {
+                Ok(event) => event,
+                Err(error) => {
+                    eprintln!("failed to receive signal: {error}");
+                    return 1;
+                }
+            };
+
+            match event.signal() {
+                Some(signal) => signal,
+                None => {
+                    eprintln!("received invalid signal number");
+                    continue;
+                }
+            }
+        };
+
+        if signal == Signal::SIGCHLD {
+            loop {
+                match waitpid(pid, Some(flags)) {
+                    Ok(WaitStatus::Exited(_, code)) => return code,
+                    Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
+                    
+                    Ok(WaitStatus::Stopped(_, sig)) => {
+                        eprintln!("child stopped by {sig:?}");
+
+                        /*
+                        * Return terminal control and stop the supervisor.
+                        * After the shell resumes, restore the child as the foreground group
+                        * and wake the child process group.
+                        */
+                        handler.transfer_to_parent();
+                        let _ = signal::raise(Signal::SIGSTOP);
+                        handler.transfer_to_child();
+                        let _ = signal::kill(Pid::from_raw(-pid.as_raw()), Signal::SIGCONT);
+                    }
+
+                    Ok(WaitStatus::StillAlive) => break,
+                    Ok(_) => continue,
+
+                    Err(Errno::EINTR) => continue,
+                    Err(Errno::ECHILD) => return 1,
+
+                    Err(error) => {
+                        eprintln!("waitpid failed: {error}");
+                        return 1;
+                    }
+                }
             }
 
-            Ok(WaitStatus::Continued(_)) | Ok(WaitStatus::StillAlive) => {
-                let _ = SignalHandler::forward_signal(pid);
-            }
-
-            Ok(WaitStatus::PtraceEvent(_, _, _)) | Ok(WaitStatus::PtraceSyscall(_)) => {}
-
-            Err(Errno::EINTR) => {
-                let _ = SignalHandler::forward_signal(pid);
-            }
-
-            Err(Errno::ECHILD) => return 1,
-
-            Err(error) => {
-                eprintln!("waitpid failed: {error}");
-                return 1;
-            }
+        } else {
+            let _ = signal::kill(Pid::from_raw(-pid.as_raw()), signal);
         }
     }
+}
+
+/**
+ * 
+ */
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+pub(crate) fn set_parent_exit_signal(signal: Signal) -> nix::Result<()> {
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            signal as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+
+    Errno::result(result).map(|_| ())
 }
 
 /**
@@ -196,6 +261,9 @@ pub fn exec(
                     errx!(1, "exec: {}: {}", path_str, err);
                 }
             };
+
+            #[cfg(feature = "use_pam")]
+            let supervisor = getppid();
     
             if !setgroups(&[]).is_ok() {
                 errx!(1, "Failed to reset group privileges");
@@ -208,6 +276,25 @@ pub fn exec(
             
             } else if !setresuid(target_uid, target_uid, user_uid).is_ok() {
                 errx!(1, "Failed to set target user");
+            }
+
+            cfg_if! {
+                /* credential changes may cause Linux to clear this,
+                 * so we call it again.
+                 */
+                if #[cfg(feature = "use_pam")] {
+                    set_parent_exit_signal(Signal::SIGKILL)
+                    .unwrap_or_else(|error| {
+                        errx!(1, "failed to restore parent-death signal: {}", error);
+                    });
+
+                    /* Also make sure that the parent did not change during 
+                     * the time we took to re-configure the death signal
+                     */
+                    if getppid() != supervisor {
+                        let _ = signal::raise(Signal::SIGKILL);
+                    }
+                }
             }
             
             if let Some(d) = cwd {

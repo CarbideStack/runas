@@ -127,11 +127,16 @@ mod feat {
     
     cfg_if! {
         if #[cfg(feature = "backend_scopex")] {
-            use crate::modules::proc::watch_process;
             use std::borrow::Cow;
             use std::os::unix::io::AsRawFd;
             use std::process;
             use std::io::{self, IsTerminal};
+            use nix::sys::signal::Signal;
+
+            use crate::modules::proc::{
+                watch_process,
+                set_parent_exit_signal
+            };
 
             use crate::modules::fork_sync::{
                 ForkSync,
@@ -287,6 +292,16 @@ mod feat {
                             match unsafe { fork() } {
                                 Ok(ForkResult::Child) => {
                                     let pipe = sync.into_child();
+
+                                    /* The child dies when the parent does.
+                                     * This is not completly stable as the process we launch
+                                     * can easily reconfigure this, but it helps with simple
+                                     * things. 
+                                     */
+                                    if let Err(error) = set_parent_exit_signal(Signal::SIGKILL) {
+                                        eprintln!("failed to configure parent-death signal: {}", error);
+                                        return Err(PAM_SYSTEM_ERR);
+                                    }
 
                                     // Create process group
                                     if let Err(err) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {

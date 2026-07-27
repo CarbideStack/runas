@@ -33,6 +33,7 @@
 
 use crate::shared::*;
 use crate::errx;
+use super::signal_recv::SignalReceiver;
 use std::fmt;
 use nix::errno::Errno;
 use nix::sys::stat::Mode;
@@ -49,16 +50,8 @@ use nix::poll::{
     PollFlags
 };
 
-use nix::sys::signalfd::{
-    SfdFlags, 
-    SignalFd
-};
-
 use nix::sys::signal::{
-    pthread_sigmask,
     raise,
-    SigSet,
-    SigmaskHow,
     Signal
 };
 
@@ -94,83 +87,13 @@ const MAX_INPUT_LEN: usize = 1024;
 /**
  * 
  */
-struct SignalHandler {
-    previous_mask: SigSet,
-    descriptor: SignalFd,
-}
-
-impl SignalHandler {
-    /**
-     * 
-     */
-    fn install() -> Result<Self, PromptError> {
-        let mut signals = SigSet::empty();
-        signals.add(Signal::SIGHUP);
-        signals.add(Signal::SIGINT);
-        signals.add(Signal::SIGQUIT);
-        signals.add(Signal::SIGTERM);
-        signals.add(Signal::SIGTSTP);
-
-        let mut previous_mask = SigSet::empty();
-
-        pthread_sigmask(
-            SigmaskHow::SIG_BLOCK,
-            Some(&signals),
-            Some(&mut previous_mask),
-        )
-        .map_err(|error| PromptError::Io("failed to block prompt signals", error))?;
-
-        match SignalFd::with_flags(&signals, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK) {
-            Ok(descriptor) => Ok(Self {
-                descriptor,
-                previous_mask,
-            }),
-
-            Err(error) => {
-                /*
-                 * Self was not constructed, so Drop cannot restore the mask.
-                 */
-                let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous_mask), None);
-
-                Err(PromptError::Io("failed to create signal descriptor", error))
-            }
-        }
-    }
-
-    /**
-     * 
-     */
-    fn descriptor(&self) -> RawFd {
-        self.descriptor.as_raw_fd()
-    }
-
-    /**
-     * 
-     */
-    fn read_signal(&mut self) -> Result<Option<Signal>, PromptError> {
-        let info = self
-            .descriptor
-            .read_signal()
-            .map_err(|error| PromptError::Io("failed to read signal descriptor", error))?;
-
-        match info {
-            Some(info) => Signal::try_from(info.ssi_signo as i32)
-                .map(Some)
-                .map_err(|error| PromptError::Io("invalid signal number", error)),
-
-            None => Ok(None),
-        }
-    }
-}
-
-impl Drop for SignalHandler {
-    /**
-     * 
-     */
-    fn drop(&mut self) {
-        let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.previous_mask), None);
-    }
-}
+const PROMPT_SIGNALS: &[Signal] = &[
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGQUIT,
+    Signal::SIGTERM,
+    Signal::SIGTSTP,
+];
 
 /**
  *
@@ -341,7 +264,9 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
      * Prompt restores the terminal before SignalHandler restores the old
      * signal actions.
      */
-    let mut signals = SignalHandler::install()?;
+    let mut signals =
+        SignalReceiver::install(PROMPT_SIGNALS.iter().copied())
+            .map_err(|error| { PromptError::Io("failed to create signal receiver", error) })?;
 
     let use_stdin = (flags & RunFlags::AUTH_STDIN) != RunFlags::NONE;
     let hide = (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE;
@@ -355,7 +280,7 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
         }
     };
 
-    let mut prompt = Prompt::new(input, output, signals.descriptor(), owned);
+    let mut prompt = Prompt::new(input, output, signals.as_raw_fd(), owned);
 
     if !use_stdin {
         if hide {
@@ -411,7 +336,23 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
             }
 
             Err(Errno::EINTR) => {
-                if let Some(signal) = signals.read_signal()? {
+                let event = signals
+                    .read()
+                    .map_err(|error| {
+                        PromptError::Io(
+                            "failed to read signal receiver",
+                            error,
+                        )
+                    })?;
+
+                if let Some(event) = event {
+                    let signal = event
+                        .signal()
+                        .ok_or(PromptError::Io(
+                            "invalid signal number",
+                            Errno::EINVAL,
+                        ))?;
+
                     return Err(PromptError::Interrupted(signal));
                 }
             }

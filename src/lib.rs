@@ -31,6 +31,7 @@ mod ffi {
 pub mod modules {
     pub mod user;
     pub(crate) mod passwd;
+    pub(crate) mod signal_recv;
     pub mod auth;
     pub mod proc;
     
@@ -41,7 +42,7 @@ pub mod modules {
     pub(crate) mod fork_sync;
 
     #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-    pub(crate) mod sig_handler;
+    pub(crate) mod fg_handler;
 }
 
 extern crate cfg_if;
