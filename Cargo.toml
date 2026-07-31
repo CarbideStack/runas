@@ -15,6 +15,7 @@ nix = { version = "0.26", default-features = false, features = [
     "user",      # for Uid, Gid, etc.
     "poll",
 ] }
+libc = "0.2"
 getopts = "0.2"
 bitflags = "2.5"
 cfg-if = "1"

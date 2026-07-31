@@ -31,52 +31,57 @@
  *     afterward.
  */
 
-use crate::shared::*;
-use crate::errx;
-use super::signal_recv::SignalReceiver;
-use std::fmt;
-use nix::errno::Errno;
-use nix::sys::stat::Mode;
+use crate::{
+    shared::{
+        RunFlags,
+        PATH_TTY,
+    },
+    modules::{
+        signal_recv::SignalReceiver,
+        error::Error
+    }
+};
 use zeroize::Zeroizing;
-
-use std::os::unix::io::{
-    AsRawFd, 
-    RawFd
+use nix::{
+    errno::Errno,
+    sys::{
+        stat::Mode,
+        signal::{
+            raise,
+            Signal
+        },
+        termios::{
+            SetArg, 
+            LocalFlags, 
+            Termios,
+            tcsetattr, 
+            tcgetattr
+        }
+    },
+    poll::{
+        poll, 
+        PollFd, 
+        PollFlags
+    },
+    fcntl::{
+        OFlag,
+        open
+    },
+    libc::{
+        STDIN_FILENO, 
+        STDERR_FILENO
+    },
+    unistd::{
+        close,
+        read, 
+        write
+    }
 };
-
-use nix::poll::{
-    poll, 
-    PollFd, 
-    PollFlags
-};
-
-use nix::sys::signal::{
-    raise,
-    Signal
-};
-
-use nix::libc::{
-    STDIN_FILENO, 
-    STDERR_FILENO
-};
-
-use nix::sys::termios::{
-    SetArg, 
-    LocalFlags, 
-    Termios,
-    tcsetattr, 
-    tcgetattr
-};
-    
-use nix::fcntl::{
-    OFlag,
-    open
-};
-    
-use nix::unistd::{
-    close,
-    read, 
-    write
+use std::{
+    os::unix::io::{
+        AsRawFd, 
+        RawFd
+    }
 };
 
 /**
@@ -94,32 +99,6 @@ const PROMPT_SIGNALS: &[Signal] = &[
     Signal::SIGTERM,
     Signal::SIGTSTP,
 ];
-
-/**
- *
- */
-#[derive(Debug)]
-enum PromptError {
-    Io(&'static str, Errno),
-    InvalidUtf8(std::str::Utf8Error),
-    BufferOverflow,
-    Interrupted(Signal),
-}
-
-impl fmt::Display for PromptError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(context, error) => write!(formatter, "{}\n\t{}", context, error),
-            Self::InvalidUtf8(error) => write!(formatter, "{}\n\t{}", MSG_PARSE_UTF8, error),
-            Self::BufferOverflow => write!(
-                formatter,
-                "input exceeds the maximum length of {} bytes",
-                MAX_INPUT_LEN
-            ),
-            Self::Interrupted(signal) => write!(formatter, "interrupted by {}", signal),
-        }
-    }
-}
 
 /**
  *
@@ -149,8 +128,8 @@ impl Prompt {
     /**
      *
      */
-    fn hide_input(&mut self) -> Result<(), PromptError> {
-        let original = tcgetattr(self.input).map_err(|error| PromptError::Io(MSG_IO_TTY_ATTR, error))?;
+    fn hide_input(&mut self) -> Result<(), Error> {
+        let original = tcgetattr(self.input)?;
         let mut changed = original.clone();
 
         changed.local_flags &= !(LocalFlags::ICANON | LocalFlags::ECHO);
@@ -161,8 +140,7 @@ impl Prompt {
         * Drop still attempts to restore it.
         */
         self.termios = Some(original);
-        tcsetattr(self.input, SetArg::TCSANOW, &changed)
-            .map_err(|error| PromptError::Io(MSG_IO_TTY_ATTR, error))?;
+        tcsetattr(self.input, SetArg::TCSANOW, &changed)?;
 
         Ok(())
     }
@@ -170,14 +148,12 @@ impl Prompt {
     /**
      * 
      */
-    fn write(&mut self, mut bytes: &[u8]) -> Result<(), PromptError> {
+    fn write(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
         while !bytes.is_empty() {
             match write(self.output, bytes) {
                 Ok(0) => {
-                    return Err(PromptError::Io(
-                        "failed to write prompt",
-                        Errno::EIO,
-                    ));
+                    // Should not happen, if it fails then we should get an error instead
+                    return Err(Error::StaticMessage("failed to write prompt"));
                 }
                 
                 Ok(written) => {
@@ -187,10 +163,7 @@ impl Prompt {
                 Err(Errno::EINTR) => continue,
 
                 Err(error) => {
-                    return Err(PromptError::Io(
-                        "failed to write prompt",
-                        error,
-                    ));
+                    return Err(Error::from(error));
                 }
             }
         }
@@ -258,15 +231,13 @@ impl Drop for Prompt {
 /**
  * 
  */
-fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
+fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, Error> {
     /*
      * Rust drops locals in reverse order, so
      * Prompt restores the terminal before SignalHandler restores the old
      * signal actions.
      */
-    let mut signals =
-        SignalReceiver::install(PROMPT_SIGNALS.iter().copied())
-            .map_err(|error| { PromptError::Io("failed to create signal receiver", error) })?;
+    let mut signals = SignalReceiver::install(PROMPT_SIGNALS.iter().copied())?;
 
     let use_stdin = (flags & RunFlags::AUTH_STDIN) != RunFlags::NONE;
     let hide = (flags & RunFlags::PROMPT_HIDE) != RunFlags::NONE;
@@ -336,40 +307,31 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, PromptError> {
             }
 
             Err(Errno::EINTR) => {
-                let event = signals
-                    .read()
-                    .map_err(|error| {
-                        PromptError::Io(
-                            "failed to read signal receiver",
-                            error,
-                        )
-                    })?;
+                let event = signals.read()?;
 
                 if let Some(event) = event {
                     let signal = event
-                        .signal()
-                        .ok_or(PromptError::Io(
-                            "invalid signal number",
-                            Errno::EINVAL,
+                        .signal().ok_or(Error::Message(
+                            format!("invalid signal number {}", Errno::EINVAL)
                         ))?;
 
-                    return Err(PromptError::Interrupted(signal));
+                    return Err(Error::Interrupted(signal));
                 }
             }
 
             Err(error) => {
-                return Err(PromptError::Io("failed to read input", error));
+                return Err(Error::from(error));
             }
         }
     }
 
     if overflow != 0 {
-        return Err(PromptError::BufferOverflow);
+        return Err(Error::Message(
+            format!("input exceeds the maximum length of {} bytes", MAX_INPUT_LEN)
+        ));
     }
 
-    let password = std::str::from_utf8(buffer.as_slice())
-        .map_err(PromptError::InvalidUtf8)?
-        .to_owned();
+    let password = std::str::from_utf8(buffer.as_slice())?.to_owned();
 
     Ok(password)
 }
@@ -437,17 +399,13 @@ pub(crate) fn time_compare(known: &str, secret: &str) -> bool {
  * # Parameters
  * - `msg`: Prompt message displayed to the user.
  * - `flags`: Behavior control flags (`RunFlags::AUTH_STDIN`, etc.).
- *
- * # Returns
- * The password input as a `String`. On fatal I/O or UTF-8 conversion errors,
- * the process terminates via `errx!()`.
  */
-pub(crate) fn ask_password(msg: &str, flags: RunFlags) -> String {
+pub(crate) fn ask_password(msg: &str, flags: RunFlags) -> Result<String, Error> {
     loop {
         match launch_prompt(msg, flags) {
-            Ok(password) => return password,
+            Ok(password) => return Ok(password),
 
-            Err(PromptError::Interrupted(signal)) => {
+            Err(Error::Interrupted(signal)) => {
                 /*
                 * If SIGTSTP stops the process, retry the prompt after SIGCONT.
                 * If another signal was ignored or handled by the caller,
@@ -458,7 +416,7 @@ pub(crate) fn ask_password(msg: &str, flags: RunFlags) -> String {
             }
 
             Err(error) => {
-                errx!(1, "ask_password: {}", error);
+                return Err(error);
             }
         }
     }

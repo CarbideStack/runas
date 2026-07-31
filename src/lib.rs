@@ -29,11 +29,14 @@ mod ffi {
 }
 
 pub mod modules {
+    pub mod error;
     pub mod user;
-    pub(crate) mod passwd;
-    pub(crate) mod signal_recv;
     pub mod auth;
     pub mod proc;
+    pub mod env;
+
+    pub(crate) mod passwd;
+    pub(crate) mod signal_recv;
     
     #[cfg(feature = "backend_scopex")]
     pub(crate) mod path;
@@ -44,8 +47,6 @@ pub mod modules {
     #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
     pub(crate) mod fg_handler;
 }
-
-extern crate cfg_if;
 
 #[cfg(all(feature = "backend_run0", feature = "backend_scopex"))]
 compile_error!("You cannot combine the features 'backend_run0' and 'backend_scopex'");

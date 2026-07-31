@@ -18,25 +18,37 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
 // DEALINGS IN THE SOFTWARE.
 
-use std::env;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::ffi::CString;
-
-use std::io::{
-    self,
-    ErrorKind,
+use std::{
+    os::unix::fs::PermissionsExt,
+    ffi::CString,
+    env::{
+        var as env_var,
+    },
+    fs::{
+        canonicalize,
+        metadata
+    },
+    path::{
+        Path, 
+        PathBuf
+    },
+    io::{
+        Result as IOResult,
+        Error as IOError,
+        ErrorKind,
+    }
 };
 
-use std::path::{
-    Path, 
-    PathBuf
+use libc::{
+    ENOTDIR,
+    EACCES,
+    ENOENT
 };
 
 /**
  *
  */
-pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<PathBuf> {
+pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> IOResult<PathBuf> {
     let path = Path::new(cmd);
 
     // Case 1: already absolute
@@ -46,7 +58,7 @@ pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<P
 
     // Case 2: relative (contains /)
     if cmd.contains('/') {
-        return match fs::canonicalize(path) {
+        return match canonicalize(path) {
             Ok(full) => inspect_candidate(&full).map(|_| full),
             Err(err) => Err(err),
         };
@@ -55,7 +67,7 @@ pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<P
     let mut permission_denied = false;
 
     // Case 3: search in current PATH
-    if let Ok(path_var) = env::var("PATH") {
+    if let Ok(path_var) = env_var("PATH") {
         match search_path_var(cmd, &path_var) {
             Ok(found) => return Ok(found),
             Err(err) => {
@@ -63,7 +75,7 @@ pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<P
                     permission_denied = true;
 
                 } else if err.kind() != ErrorKind::NotFound
-                        && err.raw_os_error() != Some(nix::libc::ENOTDIR) {
+                        && err.raw_os_error() != Some(ENOTDIR) {
 
                     return Err(err);
                 }
@@ -88,7 +100,7 @@ pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<P
                     permission_denied = true;
 
                 } else if err.kind() != ErrorKind::NotFound
-                        && err.raw_os_error() != Some(nix::libc::ENOTDIR) {
+                        && err.raw_os_error() != Some(ENOTDIR) {
 
                     return Err(err);
                 }
@@ -98,17 +110,17 @@ pub(crate) fn find_executable(cmd: &str, extra_envp: &[CString]) -> io::Result<P
 
     // Case 5: missing or permission denied
     if permission_denied {
-        Err(io::Error::from_raw_os_error(nix::libc::EACCES))
+        Err(IOError::from_raw_os_error(EACCES))
 
     } else {
-        Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+        Err(IOError::from_raw_os_error(ENOENT))
     }
 }
 
 /**
  *
  */
-fn search_path_var(cmd: &str, path_var: &str) -> io::Result<PathBuf> {
+fn search_path_var(cmd: &str, path_var: &str) -> IOResult<PathBuf> {
     let mut permission_denied = false;
 
     for dir in path_var.split(':') {
@@ -125,7 +137,7 @@ fn search_path_var(cmd: &str, path_var: &str) -> io::Result<PathBuf> {
                     permission_denied = true;
 
                 } else if err.kind() != ErrorKind::NotFound
-                        && err.raw_os_error() != Some(nix::libc::ENOTDIR) {
+                        && err.raw_os_error() != Some(ENOTDIR) {
 
                     return Err(err);
                 }
@@ -134,24 +146,24 @@ fn search_path_var(cmd: &str, path_var: &str) -> io::Result<PathBuf> {
     }
 
     if permission_denied {
-        Err(io::Error::from_raw_os_error(nix::libc::EACCES))
+        Err(IOError::from_raw_os_error(EACCES))
 
     } else {
-        Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+        Err(IOError::from_raw_os_error(ENOENT))
     }
 }
 
 /**
  *
  */
-fn inspect_candidate(path: &Path) -> io::Result<()> {
-    let metadata = fs::metadata(path)?;
+fn inspect_candidate(path: &Path) -> IOResult<()> {
+    let metadata = metadata(path)?;
 
     if !metadata.is_file() {
-        return Err(io::Error::from_raw_os_error(nix::libc::EACCES));
+        return Err(IOError::from_raw_os_error(EACCES));
 
     } else if metadata.permissions().mode() & 0o111 == 0 {
-        return Err(io::Error::from_raw_os_error(nix::libc::EACCES));
+        return Err(IOError::from_raw_os_error(EACCES));
     }
 
     Ok(())

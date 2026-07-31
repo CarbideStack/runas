@@ -25,33 +25,17 @@ use std::ffi::{
     NulError
 };
 
-/**
- *
- */
-pub trait TypeCheck {
-    fn is_true(&self) -> bool;
-}
-
 /* Just because Rust's naming scheme is ugly and stupid.
  * It may not be a real NULL pointer, but it symbols the same thing. 
  */
 pub type NULL = ();
 pub const NULL: NULL = ();
 
-pub const MSG_UNWRAP_RESULT: &'static str = "Failed while unwrapping result or option";
-pub const MSG_CALL_IMPL: &'static str = "Invalid call to missing implementation";
-pub const MSG_PARSE_UTF8: &'static str = "Failed to parse UTF-8 data";
-pub const MSG_PARSE_CSTRING: &'static str = "Failed to parse CString";
-pub const MSG_PARSE_NUM: &'static str = "Failed to parse numeric value";
-pub const MSG_IO_USER_DB: &'static str = "Failed to open user database";
-pub const MSG_IO_TTY_ATTR: &'static str = "Failed to configure TTY for user input";
-pub const MSG_IO_NONBLOCK: &'static str = "Failed to set input stream to non-blocking mode";
-pub const MSG_PAM_NULL_POINTER: &'static str = "Failed PAM authentication, received null pointer message";
-
 pub const AUTH_GROUP: &'static str = "wheel";
 pub const EMPTY: &'static str = "";
 pub const PATH_TTY: &'static str = "/dev/tty";
 pub const PROMPT_TEXT: &'static str = "Password: ";
+pub const ENV_FILE: &'static str = "/etc/runas.env";
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,7 +67,7 @@ macro_rules! errx {
 
 #[cfg_attr(debug_assertions, track_caller)]
 pub fn into_cstring<T: Into<Vec<u8>>>(s: T) -> CString {
-    CString::new(s).unwrap_or_else(|_e: NulError| {
+    CString::new(s).unwrap_or_else(|e: NulError| {
         cfg_if! {
             if #[cfg(debug_assertions)] {
                 let loc = std::panic::Location::caller();
@@ -91,13 +75,13 @@ pub fn into_cstring<T: Into<Vec<u8>>>(s: T) -> CString {
                     "debug: CString::new() failed at {}:{} -> {} (nul byte at position {})",
                     loc.file(),
                     loc.line(),
-                    _e,
-                    _e.nul_position()
+                    e,
+                    e.nul_position()
                 );
             }
         }
 
-        errx!(1, "CString: {}", MSG_PARSE_CSTRING);
+        errx!(1, "CString: {}", e);
     })
 }
 

@@ -34,18 +34,38 @@
  * Different pending signals remain individually readable.
  */
 
-use std::convert::TryFrom;
-use std::marker::PhantomData;
-use std::os::fd::{AsRawFd, RawFd};
-use std::rc::Rc;
-
-use nix::errno::Errno;
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
-use nix::sys::signalfd::{
-    SignalFd,
-    siginfo,
-    SfdFlags
+use std::{
+    convert::TryFrom,
+    marker::PhantomData,
+    rc::Rc,
+    os::{
+        fd::{
+            AsRawFd,
+            RawFd
+        }
+    }
+};
+use nix::{
+    errno::Errno,
+    Result as NixResult,
+    poll::{
+        poll,
+        PollFd,
+        PollFlags
+    },
+    sys::{
+        signal::{
+            pthread_sigmask,
+            SigSet,
+            SigmaskHow,
+            Signal
+        },
+        signalfd::{
+            SignalFd,
+            siginfo,
+            SfdFlags
+        }
+    }
 };
 
 /**
@@ -113,7 +133,7 @@ impl SignalReceiver {
      *
      * `SIGKILL` and `SIGSTOP` cannot be blocked and are rejected.
      */
-    pub fn install<I>(signals: I) -> nix::Result<Self>
+    pub fn install<I>(signals: I) -> NixResult<Self>
     where
         I: IntoIterator<Item = Signal>,
     {
@@ -158,7 +178,7 @@ impl SignalReceiver {
      *
      * `None` means no selected signal is pending. This method never blocks.
      */
-    pub fn read(&mut self) -> nix::Result<Option<SignalEvent>> {
+    pub fn read(&mut self) -> NixResult<Option<SignalEvent>> {
         self.fd
             .read_signal()
             .map(|event| event.map(|info| SignalEvent { info }))
@@ -170,7 +190,7 @@ impl SignalReceiver {
      * Unblocked signals may interrupt `poll()`. Interrupted waits are retried.
      */
     #[allow(dead_code)]
-    pub fn wait(&mut self) -> nix::Result<SignalEvent> {
+    pub fn wait(&mut self) -> NixResult<SignalEvent> {
         loop {
             if let Some(event) = self.read()? {
                 return Ok(event);

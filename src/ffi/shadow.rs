@@ -39,7 +39,7 @@
  */
 
 mod c_ffi {
-    use nix::libc::{
+    use libc::{
         spwd, 
         c_char
     };
@@ -63,19 +63,18 @@ mod c_ffi {
     }
 }
 
-use crate::shared::*;
-use crate::errx;
-use std::ptr;
 use zeroize::Zeroize;
+use crate::modules::error::Error;
+use libc::spwd;
 
-use nix::libc::{
-    spwd, 
-    c_char
-};
-
-use std::ffi::{
-    CStr, 
-    CString
+use std::{
+    io::{
+        Error as IOError
+    },
+    ffi::{
+        CStr,
+        CString
+    },
 };
 
 /**
@@ -99,30 +98,33 @@ pub struct ShadowEntry {
  * @param passwd  Plaintext password
  * @param salt    Salt string (e.g., "$6$somesalt")
  */
-pub fn crypt(passwd: String, salt: &str) -> Option<String> {
+pub fn crypt(passwd: String, salt: &str) -> Result<String, Error> {
     let mut bytes = passwd.into_bytes();
-    bytes.push(0u8);
-    
-    let c_salt = CString::new(salt).unwrap_or_else(|e| {
+    bytes.push(0);
+
+    let c_salt = CString::new(salt).inspect_err(|_| {
         bytes.zeroize();
-        errx!(1, "crypt: {}\n\t{}", MSG_PARSE_CSTRING, e);
-    });
-    
-    let hash: *mut c_char = unsafe {
-        c_ffi::crypt(bytes.as_ptr() as *const c_char, c_salt.as_ptr())
-    };
-    
-    bytes.zeroize();
-    
-    if hash == ptr::null_mut() {
-        return None;
+    })?;
+
+    unsafe {
+        *libc::__errno_location() = 0;
     }
-    
-    return Some(
-        unsafe {
-            CStr::from_ptr(hash).to_string_lossy().into_owned()
-        }
-    );
+
+    let hash = unsafe {
+        c_ffi::crypt(bytes.as_ptr().cast(), c_salt.as_ptr())
+    };
+
+    bytes.zeroize();
+
+    if hash.is_null() {
+        return Err(Error::Io(IOError::last_os_error()));
+    }
+
+    Ok(
+        unsafe { CStr::from_ptr(hash) }
+            .to_string_lossy()
+            .into_owned()
+    )
 }
 
 /**
@@ -135,25 +137,42 @@ pub fn crypt(passwd: String, salt: &str) -> Option<String> {
  *
  * @param username  Username to look up
  */
-pub fn getspnam(username: &str) -> Option<ShadowEntry> {
-    let c_username = CString::new(username).unwrap_or_else(|e| { errx!(1, "getspnam: {}\n\t{}", MSG_PARSE_CSTRING, e); });
+pub fn getspnam(username: &str) -> Result<Option<ShadowEntry>, Error> {
+    let c_username = CString::new(username)?;
 
     unsafe {
-        let spwd_ptr: *mut spwd = c_ffi::getspnam(c_username.as_ptr());
-        
-        if spwd_ptr != ptr::null_mut() {
-            let entry = &*spwd_ptr;
-            
-            return Some(ShadowEntry {
-                passwd_hash: CStr::from_ptr(entry.sp_pwdp).to_string_lossy().into_owned(),
-                last_change: entry.sp_lstchg,
-                max_age: entry.sp_max,
-                inactive: entry.sp_inact,
-                expiry: entry.sp_expire,
-            });
-        }
+        // Clear OS Level error
+        *libc::__errno_location() = 0;
     }
-    
-    return None;
-}
 
+    let spwd_ptr: *mut spwd = unsafe {
+        c_ffi::getspnam(c_username.as_ptr())
+    };
+
+    if spwd_ptr.is_null() {
+        let err = IOError::last_os_error();
+
+        if err.raw_os_error() != Some(0) {
+            return Err(Error::Io(err));
+        }
+
+        return Ok(None);
+    }
+
+    let entry = unsafe {
+        &*spwd_ptr
+    };
+
+    Ok(Some(ShadowEntry {
+        passwd_hash: unsafe {
+            CStr::from_ptr(entry.sp_pwdp)
+        }
+        .to_string_lossy()
+        .into_owned(),
+
+        last_change: entry.sp_lstchg,
+        max_age: entry.sp_max,
+        inactive: entry.sp_inact,
+        expiry: entry.sp_expire,
+    }))
+}

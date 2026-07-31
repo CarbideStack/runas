@@ -34,20 +34,21 @@
  * ```
  */
 
-use crate::shared::*;
-use crate::errx;
-use std::ffi::CString;
+use super::error::Error;
 
-use std::cell::{
-    RefCell,
-    Ref
+use std::{
+    ffi::CString,
+    cell::{
+        RefCell,
+        Ref
+    }
 };
 
 use nix::unistd::{
-    User as C_User, 
-    Group as C_Group,
-    Uid as C_Uid,
-    Gid as C_Gid,
+    User as CUser, 
+    Group as CGroup,
+    Uid as CUid,
+    Gid as CGid,
     getuid,
     getgrouplist
 };
@@ -56,16 +57,16 @@ use nix::unistd::{
  * Represents a system group, including name and numeric ID.
  */
 pub struct Group {
-    pub(in self) gid: C_Gid,
+    pub(in self) gid: CGid,
     pub(in self) name: String
 }
 
 /**
  * Represents a system user, including name, UID, and primary group ID.
  */
-pub(crate) struct User {
-    pub(in self) uid: C_Uid,
-    pub(in self) gid: C_Gid,
+pub struct User {
+    pub(in self) uid: CUid,
+    pub(in self) gid: CGid,
     pub(in self) name: String,
     pub(in self) home: String,
     pub(in self) shell: String,
@@ -77,7 +78,7 @@ pub(crate) struct User {
 pub struct Account {
     pub(in self) user: User,
     pub(in self) group: Group,
-    pub(in self) group_list: RefCell<Option<Vec<C_Gid>>>
+    pub(in self) group_list: RefCell<Option<Vec<CGid>>>
 }
 
 /**
@@ -88,93 +89,83 @@ impl User {
     /**
      *
      */
-    pub(crate) fn is_root(&self) -> bool { self.uid.is_root() }
+    pub fn is_root(&self) -> bool { self.uid.is_root() }
 
     /**
      * Return the user shell
      */
-    pub(crate) fn shell(&self) -> &str { &self.shell }
+    pub fn shell(&self) -> &str { &self.shell }
 
     /**
      * Return the user home dir
      */
-    pub(crate) fn home(&self) -> &str { &self.home }
+    pub fn home(&self) -> &str { &self.home }
 
     /**
      * Return the user name
      */
-    pub(crate) fn name(&self) -> &str { &self.name }
+    pub fn name(&self) -> &str { &self.name }
     
     /**
      * Return the user ID
      */
-    pub(crate) fn uid(&self) -> C_Uid { self.uid }
+    pub fn uid(&self) -> CUid { self.uid }
     
     /**
      * Return the user primary group ID
      */
-    pub(crate) fn gid(&self) -> C_Gid { self.gid }
+    pub fn gid(&self) -> CGid { self.gid }
 
     /**
      * Create a user from a name or UID string.
      *
      * Accepts either a username (e.g., `"bob"`) or a numeric UID (e.g., `"1000"`).
-     * Validates the entry against the system database and returns `Some(User)` if found.
-     *
-     * Aborts the process with `errx!()` if the system user database cannot be queried.
+     * Validates the entry against the system database and returns `Ok(User)` if found.
      */
-    pub(crate) fn from(user: &str) -> Option<Self> {
-        let mut uinfo: Option<C_User>;
+    pub fn from(user: &str) -> Result<Option<Self>, Error> {
+        let lookup_uid = |s: &str| -> Result<Option<CUser>, Error> {
+            Ok(CUser::from_uid(CUid::from_raw(s.parse()?))?)
+        };
 
-        if let Some(rest) = user.strip_prefix('#') {
-            // Explicit numeric ID (forced with '#')
-            let parsed_uid = rest.parse::<u32>().unwrap_or_else(|_e| { errx!(1, MSG_PARSE_NUM); });
-            let uid = C_Uid::from_raw(parsed_uid);
-
-            // Validate that this UID exists
-            uinfo = C_User::from_uid(uid).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
+        let info = if let Some(rest) = user.strip_prefix('#') {
+            lookup_uid(rest)?
 
         } else if user.chars().all(char::is_numeric) {
-            // Numeric-looking name — try name first, then fallback to UID lookup
-            uinfo = C_User::from_name(user).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
-
-            if uinfo.is_none() {
-                let parsed_uid = user.parse::<u32>().unwrap_or_else(|_e| { errx!(1, MSG_PARSE_NUM); });
-                let uid = C_Uid::from_raw(parsed_uid);
-                
-                uinfo = C_User::from_uid(uid).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
+            match CUser::from_name(user)? {
+                Some(info) => Some(info),
+                None => lookup_uid(user)?,
             }
 
         } else {
-            // Normal username
-            uinfo = C_User::from_name(user).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
-        }
-        
-        if let Some(uinfo) = uinfo {
-            return Some( 
+            CUser::from_name(user)?
+        };
+
+        if let Some(info) = info {
+            return Ok(Some( 
                 User {
-                    gid: uinfo.gid,
-                    uid: uinfo.uid,
-                    name: uinfo.name,
+                    gid: info.gid,
+                    uid: info.uid,
+                    name: info.name,
                     
-                    home: uinfo.dir.into_os_string()
+                    home: info.dir.into_os_string()
                                     .into_string()
-                                    .unwrap_or_else(|_e| { errx!(1, "Invalid UTF-8 in user home path"); }),
+                                    .map_err(|_| Error::StaticMessage("user home path is not valid UTF-8"))?,
                                     
-                    shell: uinfo.shell.into_os_string()
+                    shell: info.shell.into_os_string()
                                     .into_string()
-                                    .unwrap_or_else(|_e| { errx!(1, "Invalid UTF-8 in user home path"); })
+                                    .map_err(|_| Error::StaticMessage("user shell path is not valid UTF-8"))?,
                 } 
-           );
+           ));
         }
         
-        None
+        return Ok(None);
     }
 }
 
 /**
  *
  */
+#[allow(dead_code)]
 impl Group {
     /**
      * Return the user name
@@ -184,7 +175,7 @@ impl Group {
     /**
      * Return the user primary group ID
      */
-    pub(crate) fn gid(&self) -> C_Gid { self.gid }
+    pub fn gid(&self) -> CGid { self.gid }
     
     /**
      * Create a group from a name or GID string.
@@ -192,53 +183,46 @@ impl Group {
      * Accepts either a group name or a numeric GID.
      * Validates the entry against the system database and returns `Some(Group)` if found.
      */
-    pub fn from(group: &str) -> Option<Self> {
-        let mut ginfo: Option<C_Group>;
-        
-        if let Some(rest) = group.strip_prefix('#') {
-            // Explicit numeric ID (forced with '#')
-            let parsed_gid = rest.parse::<u32>().unwrap_or_else(|_e| { errx!(1, MSG_PARSE_NUM); });
-            let gid = C_Gid::from_raw(parsed_gid);
+    pub fn from(group: &str) -> Result<Option<Self>, Error> {
+        let lookup_gid = |s: &str| -> Result<Option<CGroup>, Error> {
+            Ok(CGroup::from_gid(CGid::from_raw(s.parse()?))?)
+        };
 
-            // Validate that this GID exists
-            ginfo = C_Group::from_gid(gid).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
+        let info = if let Some(rest) = group.strip_prefix('#') {
+            lookup_gid(rest)?
 
         } else if group.chars().all(char::is_numeric) {
-            // Numeric-looking name — try name first, then fallback to GID lookup
-            ginfo = C_Group::from_name(group).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
-
-            if ginfo.is_none() {
-                let parsed_gid = group.parse::<u32>().unwrap_or_else(|_e| { errx!(1, MSG_PARSE_NUM); });
-                let gid = C_Gid::from_raw(parsed_gid);
-                
-                ginfo = C_Group::from_gid(gid).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
+            match CGroup::from_name(group)? {
+                Some(info) => Some(info),
+                None => lookup_gid(group)?,
             }
-        
+
         } else {
-            ginfo = C_Group::from_name(group).unwrap_or_else(|_e| { errx!(1, MSG_IO_USER_DB); });
-        }
+            CGroup::from_name(group)?
+        };
         
-        if let Some(ginfo) = ginfo {
-            return Some( 
+        if let Some(info) = info {
+            return Ok(Some( 
                 Group { 
-                    gid: ginfo.gid,
-                    name: ginfo.name 
+                    gid: info.gid,
+                    name: info.name 
                 } 
-           );
+           ));
         }
         
-        None
+        return Ok(None);
     }
 }
 
 /**
  *
  */
+#[allow(dead_code)]
 impl Account {
     /**
      *
      */
-    pub(crate) fn is_root(&self) -> bool { self.user.uid.is_root() }
+    pub fn is_root(&self) -> bool { self.user.uid.is_root() }
 
     /**
      * Return the user shell
@@ -258,18 +242,17 @@ impl Account {
     /**
      * Return the user ID
      */
-    pub fn uid(&self) -> C_Uid { self.user.uid }
+    pub fn uid(&self) -> CUid { self.user.uid }
     
     /**
      * Return the user group ID
      */
-    pub fn gid(&self) -> C_Gid { self.group.gid }
+    pub fn gid(&self) -> CGid { self.group.gid }
 
     /**
      * Return the user object
      */
-    #[allow(dead_code)]
-    pub(crate) fn user(&self) -> &User { &self.user }
+    pub fn user(&self) -> &User { &self.user }
     
     /**
      * Return the group object
@@ -279,8 +262,7 @@ impl Account {
     /**
      *
      */
-    #[allow(dead_code)]
-    pub(crate) fn set_user(&mut self, user: User) {
+    pub fn set_user(&mut self, user: User) {
         self.user = user;
     }
     
@@ -294,7 +276,7 @@ impl Account {
     /**
      * Get an instance of the current executing account
      */
-    pub fn current() -> Option<Self> {
+    pub fn current() -> Result<Option<Self>, Error> {
         let uid = getuid().as_raw().to_string();
         Self::from(&uid)
     }
@@ -304,65 +286,50 @@ impl Account {
      *
      * Looks up both user and primary group entries and combines them into a full `Account`.
      */
-    pub fn from(user: &str) -> Option<Self> {
-        if let Some(user) = User::from(user) {
-            if let Some(group) = Group::from(&user.gid.to_string()) { 
-                return Some(
-                    Account {
-                        user: user, 
-                        group: group, 
-                        group_list: RefCell::new(None)
-                    }
-                );
-            }
-        }
-        
-        None
+    pub fn from(user: &str) -> Result<Option<Self>, Error> {
+        let Some(user) = User::from(user)? else {
+            return Ok(None);
+        };
+
+        let Some(group) = Group::from(&user.gid.to_string())? else {
+            return Ok(None);
+        };
+
+        Ok(Some(Account {
+            user,
+            group,
+            group_list: RefCell::new(None),
+        }))
     }
     
     /**
      * Get a list of all Gid's that this account is a member of.
      */
-    pub(crate) fn group_list(&self) -> Ref<'_, Vec<C_Gid>> {
+    pub fn group_list(&self) -> Result<Ref<'_, Vec<CGid>>, Error> {
         if self.group_list.borrow().is_none() {
-            let username = CString::new(self.user.name.as_str())
-                .unwrap_or_else(|_| {
-                    errx!(1, MSG_PARSE_CSTRING);
-                });
+            let username = CString::new(self.user.name.as_str())?;
+            let groups = getgrouplist(username.as_c_str(), self.user.gid)?;
 
-            let groups = getgrouplist(username.as_c_str(), self.user.gid)
-                .unwrap_or_else(|error| {
-                    errx!(
-                        1,
-                        "Failed to retrieve groups for {}: {}",
-                        self.user.name,
-                        error
-                    );
-                });
-            
             *self.group_list.borrow_mut() = Some(groups);
         }
-        
-        Ref::map(self.group_list.borrow(), |opt| opt.as_ref().unwrap())
+
+        Ok(Ref::map(
+            self.group_list.borrow(),
+            |opt| opt.as_ref().unwrap(),
+        ))
     }
     
     /**
      * Check whether this account is a member of the specified group.
      */
-    pub(crate) fn is_member(&self, group: &Group) -> bool {
+    pub fn is_member(&self, group: &Group) -> Result<bool, Error> {
         // Root belongs to everything
         if self.user.uid.is_root() {
-            return true;
+            return Ok(true);
         }
-        
-        let list: Ref<'_, Vec<C_Gid>> = self.group_list();
-        
-        for gid in &*list {
-            if *gid == group.gid() {
-                return true;
-            }
-        }
-        
-        false
+
+        let list = self.group_list()?;
+
+        Ok(list.iter().any(|gid| *gid == group.gid()))
     }
 }

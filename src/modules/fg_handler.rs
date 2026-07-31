@@ -27,22 +27,31 @@
  * `tcsetpgrp()` without being stopped by the terminal driver.
  */
 
-use std::io;
-use std::os::fd::{AsRawFd, RawFd};
-
-use nix::sys::signal::{
-    self,
-    SaFlags,
-    SigAction,
-    SigHandler,
-    SigSet,
-    Signal,
+use std::{
+    io::stdin as io_stdin,
+    os::{
+        fd::{
+            AsRawFd,
+            RawFd
+        }
+    }
 };
-
-use nix::unistd::{
-    tcgetpgrp,
-    tcsetpgrp,
-    Pid,
+use nix::{
+    sys::{
+        signal::{
+            sigaction,
+            SaFlags,
+            SigAction,
+            SigHandler,
+            SigSet,
+            Signal
+        }
+    },
+    unistd::{
+        tcgetpgrp,
+        tcsetpgrp,
+        Pid,
+    }
 };
 
 /**
@@ -69,10 +78,10 @@ impl ForegroundHandler {
         );
 
         let prev_sigttou = unsafe {
-            signal::sigaction(Signal::SIGTTOU, &ignore)?
+            sigaction(Signal::SIGTTOU, &ignore)?
         };
 
-        let terminal = io::stdin().as_raw_fd();
+        let terminal = io_stdin().as_raw_fd();
         let foreground_group = tcgetpgrp(terminal).ok().and_then(|original| {
             tcsetpgrp(terminal, child)
                 .ok()
@@ -112,7 +121,7 @@ impl Drop for ForegroundHandler {
         self.transfer_to_parent();
 
         let _ = unsafe {
-            signal::sigaction(Signal::SIGTTOU, &self.prev_sigttou)
+            sigaction(Signal::SIGTTOU, &self.prev_sigttou)
         };
     }
 }

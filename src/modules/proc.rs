@@ -18,64 +18,77 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
 // DEALINGS IN THE SOFTWARE.
 
-use cfg_if::cfg_if;
-use crate::errx;
-use super::user::Account;
-use std::ffi::CString;
-use std::convert::Infallible;
-
-use nix::unistd::{
-    setgroups, 
-    setresgid, 
-    setresuid
+use crate::modules::{
+    env::clean_environment,
+    error::Error,
+    user::Account,
 };
 
-cfg_if! {
-    if #[cfg(feature = "backend_scopex")] {
-        cfg_if! {
-            if #[cfg(feature = "use_pam")] {
-                use super::signal_recv::SignalReceiver;
-                use super::fork_sync::ForkEndpoint;
-                use super::fg_handler::ForegroundHandler;
-                use nix::errno::Errno;
-                use nix::libc;
+#[cfg(feature = "backend_scopex")]
+use super::path::find_executable;
 
-                use nix::sys::wait::{
-                    waitpid,
-                    WaitStatus,
-                    WaitPidFlag
-                };
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+use crate::modules::{
+    fg_handler::ForegroundHandler,
+    fork_sync::ForkEndpoint,
+    signal_recv::SignalReceiver,
+};
 
-                use nix::unistd::{
-                    getppid,
-                    setpgid,
-                    Pid
-                };
+use std::{
+    convert::Infallible,
+    ffi::CString
+};
 
-                use nix::sys::signal::{
-                    self, 
-                    Signal
-                };
-            }
-        }
+#[cfg(feature = "backend_scopex")]
+use std::{
+    env::set_current_dir as env_set_current_dir,
+    path::Path,
+    io::Error as IOError,
+    os::{
+        raw::c_char,
+        unix::ffi::OsStrExt,
+    },
+};
 
-        use crate::shared::*;
-        use super::path::find_executable;
-        use nix::libc::gid_t;
-        use std::os::unix::ffi::OsStrExt;
-        use std::io;
-        use std::env;
-        use std::os::raw::c_char;
-        use nix::unistd::execve;
-        
-    } else {
-        use nix::unistd::{
-            execvp, 
-            Gid, 
-            Uid
-        };
-    }
-}
+use nix::unistd::{
+    setgroups,
+    setresgid,
+    setresuid,
+};
+
+#[cfg(feature = "backend_scopex")]
+use nix::{
+    libc::{
+        initgroups as libc_initgroups,
+        gid_t
+    },
+    unistd::execve,
+};
+
+#[cfg(not(feature = "backend_scopex"))]
+use nix::unistd::{
+    execvp,
+    Gid,
+    Uid,
+};
+
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+use nix::{
+    errno::Errno,
+    sys::{
+        signal::{self, Signal},
+        wait::{
+            waitpid,
+            WaitPidFlag,
+            WaitStatus,
+        },
+    },
+    unistd::{
+        getppid,
+        setpgid,
+        Pid,
+    },
+};
 
 /**
  * 
@@ -97,29 +110,13 @@ const RECEIVED_SIGNALS: &[Signal] = &[
  *
  */
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
+pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> Result<i32, Error> {
 
-    let mut signals = match SignalReceiver::install(RECEIVED_SIGNALS.iter().copied()) {
-        Ok(receiver) => receiver,
-        Err(error) => {
-            eprintln!("failed to create signal receiver: {error}");
-            return 1;
-        }
-    };
-
-    let handler = match ForegroundHandler::install(pid) {
-        Ok(handler) => handler,
-        Err(error) => {
-            eprintln!("failed to create foreground handler: {error}");
-            return 1;
-        }
-    };
+    let mut signals = SignalReceiver::install(RECEIVED_SIGNALS.iter().copied())?;
+    let handler = ForegroundHandler::install(pid)?;
 
     // Create the process group
-    if setpgid(pid, pid).is_err() {
-        eprintln!("failed to create child process group");
-        return 1;
-    }
+    setpgid(pid, pid)?;
 
     // Notify the child process that we are ready on this side
     let _ = pipe.ready_and_wait();
@@ -136,18 +133,11 @@ pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
             Signal::SIGCHLD
 
         } else {
-            let event = match signals.wait() {
-                Ok(event) => event,
-                Err(error) => {
-                    eprintln!("failed to receive signal: {error}");
-                    return 1;
-                }
-            };
+            let event = signals.wait()?;
 
             match event.signal() {
                 Some(signal) => signal,
                 None => {
-                    eprintln!("received invalid signal number");
                     continue;
                 }
             }
@@ -156,8 +146,8 @@ pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
         if signal == Signal::SIGCHLD {
             loop {
                 match waitpid(pid, Some(flags)) {
-                    Ok(WaitStatus::Exited(_, code)) => return code,
-                    Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
+                    Ok(WaitStatus::Exited(_, code)) => return Ok(code),
+                    Ok(WaitStatus::Signaled(_, sig, _)) => return Ok(128 + sig as i32),
                     
                     Ok(WaitStatus::Stopped(_, sig)) => {
                         eprintln!("child stopped by {sig:?}");
@@ -177,12 +167,8 @@ pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
                     Ok(_) => continue,
 
                     Err(Errno::EINTR) => continue,
-                    Err(Errno::ECHILD) => return 1,
-
-                    Err(error) => {
-                        eprintln!("waitpid failed: {error}");
-                        return 1;
-                    }
+                    Err(Errno::ECHILD) => return Ok(1),
+                    Err(error) => return Err(Error::from(error))
                 }
             }
 
@@ -196,7 +182,7 @@ pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> i32 {
  * 
  */
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-pub(crate) fn set_parent_exit_signal(signal: Signal) -> nix::Result<()> {
+pub(crate) fn set_parent_exit_signal(signal: Signal) -> Result<(), Errno> {
     let result = unsafe {
         libc::prctl(
             libc::PR_SET_PDEATHSIG,
@@ -214,112 +200,92 @@ pub(crate) fn set_parent_exit_signal(signal: Signal) -> nix::Result<()> {
  *
  */
 #[cfg(feature = "backend_scopex")]
-fn initgroups(username: &str, gid: gid_t) -> Result<NULL, io::Error> {
-    let c_user = CString::new(username).unwrap_or_else(|e| { errx!(1, "initgroups: {}\n\t{}", MSG_PARSE_CSTRING, e); });
+fn initgroups(username: &str, gid: gid_t) -> Result<(), Error> {
+    let c_user = CString::new(username)?;
     
     // SAFETY: initgroups reads /etc/group and sets supplementary group list.
     // Must be called as root.
     let r = unsafe { 
-        nix::libc::initgroups(c_user.as_ptr() as *const c_char, gid) 
+        libc_initgroups(c_user.as_ptr() as *const c_char, gid) 
     };
     
     if r != 0 {
-        return Err(io::Error::last_os_error());
+        return Err(Error::from(IOError::last_os_error()));
     }
     
-    Ok(NULL)
+    Ok(())
 }
 
 /**
  *
  */
-pub fn exec(
-    user: &Account, 
+pub fn exec<
+    #[cfg(feature = "backend_scopex")]
+    P: AsRef<Path>,
+>(
+                                       user: &Account, 
     #[cfg(feature = "backend_scopex")] target: &Account, 
-    cmd: &CString, 
-    argv: &[CString], 
+                                       cmd: &CString, 
+                                       argv: &[CString], 
     #[cfg(feature = "backend_scopex")] envp: &[CString],
-    #[cfg(feature = "backend_scopex")] cwd: &Option<String>
-) -> Infallible {
+    #[cfg(feature = "backend_scopex")] cwd: Option<P>
+) -> Result<Infallible, Error> {
 
-    cfg_if! {
-        if #[cfg(feature = "backend_scopex")] {
-            let target_gid = target.gid();
-            let target_uid = target.uid();
-            let user_gid = user.gid();
-            let user_uid = user.uid();
-            
-            let path_str = cmd.to_str().unwrap_or_else(|e| { errx!(1, "exec: {}\n\t{}", MSG_PARSE_CSTRING, e); });
-            let cmd_path = match find_executable(path_str, envp) {
-                Ok(path) => {
-                    CString::new(path.as_os_str().as_bytes()).unwrap_or_else(|err| {
-                        errx!(1, "exec: {}\n\t{}", MSG_PARSE_CSTRING, err);
-                    })
-                }
+    let current_gid = user.gid();
+    let current_uid = user.uid();
 
-                Err(err) => {
-                    errx!(1, "exec: {}: {}", path_str, err);
-                }
-            };
-
-            #[cfg(feature = "use_pam")]
-            let supervisor = getppid();
-    
-            if !setgroups(&[]).is_ok() {
-                errx!(1, "Failed to reset group privileges");
-
-            } else if !initgroups(target.name(), target_gid.as_raw()).is_ok() {
-                errx!(1, "Failed to load target groups");
-                
-            } else if !setresgid(target_gid, target_gid, user_gid).is_ok() {
-                errx!(1, "Failed to set target group");
-            
-            } else if !setresuid(target_uid, target_uid, user_uid).is_ok() {
-                errx!(1, "Failed to set target user");
-            }
-
-            cfg_if! {
-                /* credential changes may cause Linux to clear this,
-                 * so we call it again.
-                 */
-                if #[cfg(feature = "use_pam")] {
-                    set_parent_exit_signal(Signal::SIGKILL)
-                    .unwrap_or_else(|error| {
-                        errx!(1, "failed to restore parent-death signal: {}", error);
-                    });
-
-                    /* Also make sure that the parent did not change during 
-                     * the time we took to re-configure the death signal
-                     */
-                    if getppid() != supervisor {
-                        let _ = signal::raise(Signal::SIGKILL);
-                    }
-                }
-            }
-            
-            if let Some(d) = cwd {
-                if let Err(e) = env::set_current_dir(d) {
-                    errx!(1, e);
-                }
-            }
-            
-            execve(&cmd_path, argv, envp).expect("Failed to spawn process")
-        
-        } else {
-            let root_gid = Gid::from_raw(0);
-            let root_uid = Uid::from_raw(0);
-
-            if !setgroups(&[]).is_ok() {
-                errx!(1, "Failed to reset group privileges");
-
-            } else if !setresgid(root_gid, root_gid, user.gid()).is_ok() {
-                errx!(1, "Failed to raise group privileges");
-
-            } else if !setresuid(root_uid, root_uid, user.uid()).is_ok() {
-                errx!(1, "Failed to raise user privileges");
-            }
-        
-            execvp(cmd, argv).expect("Failed to spawn process")
+    let (target_gid, target_uid) = {
+        #[cfg(feature = "backend_scopex")]
+        {
+            (target.gid(), target.uid())
         }
+
+        #[cfg(not(feature = "backend_scopex"))]
+        {
+            (Gid::from_raw(0), Uid::from_raw(0))
+        }
+    };
+
+    #[cfg(feature = "backend_scopex")]
+    let target_cmd = CString::new(find_executable(cmd.to_str()?, envp)?.as_os_str().as_bytes())?;
+
+    #[cfg(all(feature = "use_pam", feature = "backend_scopex"))]
+    let supervisor = getppid();
+
+    clean_environment();
+    setgroups(&[])?;
+
+    #[cfg(feature = "backend_scopex")]
+    initgroups(target.name(), target_gid.as_raw())?;
+
+    setresgid(target_gid, target_gid, current_gid)?;
+    setresuid(target_uid, target_uid, current_uid)?;
+
+    #[cfg(not(feature = "backend_scopex"))]
+    return execvp(cmd, argv).map_err(Error::from);
+
+    #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+    {
+        /* credential changes may cause Linux to clear this,
+         * so we call it again.
+         */
+        set_parent_exit_signal(Signal::SIGKILL)?;
+
+        /* Also make sure that the parent did not change during 
+         * the time we took to re-configure the death signal
+         */
+
+        if getppid() != supervisor {
+            let _ = signal::raise(Signal::SIGKILL);
+        }
+    }
+
+    #[cfg(feature = "backend_scopex")]
+    {
+        if let Some(dir) = cwd {
+            env_set_current_dir(dir)?;
+        }
+
+        return execve(&target_cmd, argv, envp).map_err(Error::from);
     }
 }

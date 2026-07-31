@@ -31,15 +31,17 @@
  * first, the peer observes EOF and aborts.
  */
 
-use nix::errno::Errno;
-use nix::fcntl::OFlag;
 use std::os::unix::io::RawFd;
-
-use nix::unistd::{
-    close, 
-    pipe2, 
-    read, 
-    write
+use nix::{
+    errno::Errno,
+    Result as NixResult,
+    fcntl::OFlag,
+    unistd::{
+        close, 
+        pipe2, 
+        read, 
+        write
+    }
 };
 
 const STATUS_READY: u8 = 1;
@@ -58,7 +60,7 @@ impl Descriptor {
     /**
      * Create the read and write descriptors for one close-on-exec pipe.
      */
-    fn pipe() -> nix::Result<(Self, Self)> {
+    fn pipe() -> NixResult<(Self, Self)> {
         let (read, write) = pipe2(OFlag::O_CLOEXEC)?;
 
         Ok((Self { raw: read }, Self { raw: write }))
@@ -67,7 +69,7 @@ impl Descriptor {
     /**
      * Write one protocol byte, retrying interrupted operations.
      */
-    fn write_byte(&self, value: u8) -> nix::Result<()> {
+    fn write_byte(&self, value: u8) -> NixResult<()> {
         loop {
             match write(self.raw, &[value]) {
                 Ok(1) => return Ok(()),
@@ -83,7 +85,7 @@ impl Descriptor {
      *
      * None indicates that the other side closed the pipe.
      */
-    fn read_byte(&self) -> nix::Result<Option<u8>> {
+    fn read_byte(&self) -> NixResult<Option<u8>> {
         let mut value = [0u8; 1];
 
         loop {
@@ -130,7 +132,7 @@ impl ForkSync {
     /**
      * Create a new synchronization pair.
      */
-    pub(crate) fn new() -> nix::Result<Self> {
+    pub(crate) fn new() -> NixResult<Self> {
         let (parent_read, child_write) = Descriptor::pipe()?;
         let (child_read, parent_write) = Descriptor::pipe()?;
 
@@ -184,7 +186,7 @@ impl ForkEndpoint {
     /**
      * Report successful initialization and wait for the peer.
      */
-    pub(crate) fn ready_and_wait(mut self) -> nix::Result<SyncDecision> {
+    pub(crate) fn ready_and_wait(mut self) -> NixResult<SyncDecision> {
         self.send_status(STATUS_READY)?;
 
         let decision = match self.read.as_ref().ok_or(Errno::EBADF)?.read_byte()? {
@@ -204,14 +206,14 @@ impl ForkEndpoint {
      * failure. Dropping this endpoint closes all remaining descriptors.
      */
     #[allow(dead_code)]
-    pub(crate) fn report_failure(mut self) -> nix::Result<()> {
+    pub(crate) fn report_failure(mut self) -> NixResult<()> {
         self.send_status(STATUS_FAILED)
     }
 
     /**
      * 
      */
-    fn send_status(&mut self, status: u8) -> nix::Result<()> {
+    fn send_status(&mut self, status: u8) -> NixResult<()> {
         if self.status_sent {
             return Err(Errno::EALREADY);
         }

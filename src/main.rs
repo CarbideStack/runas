@@ -46,52 +46,56 @@
 #[macro_use]
 extern crate runas;
 
-use cfg_if::cfg_if;
-
-use runas::shared::*;
-use runas::modules::proc::exec;
-use std::env;
-use std::ffi::CString;
-use std::fs::File;
-use std::convert::Infallible;
-
-use std::io::{
-    BufRead, 
-    BufReader
+use runas::{
+    modules::{
+        error::Error,
+        proc::exec,
+        env::load_overwrite_vars,
+        auth::authenticate,
+        user::{
+            Group, 
+            Account
+        },
+    },
+    shared::*
 };
 
-use nix::unistd::{
-    Uid,
-    Gid
+#[cfg(feature = "backend_scopex")]
+use runas::modules::env::set_environment;
+
+use std::{
+    ffi::CString,
+    collections::HashMap,
+    env::{
+        args as env_args,
+        var as env_var
+    }
 };
 
-use runas::modules::auth::{
-    authenticate,
-    AuthType
+#[cfg(feature = "backend_scopex")]
+use std::path::Path;
+
+#[cfg(not(feature = "backend_scopex"))]
+use std::{
+    io::{
+        IsTerminal,
+        stdout,
+        stderr,
+        stdin
+    }
 };
 
-use runas::modules::user::{
-    Group, 
-    Account
+#[cfg(feature = "backend_run0")]
+use std::{
+    env::current_dir as env_current_dir,
+    path::PathBuf,
+    os::unix::ffi::OsStrExt
 };
 
 use getopts::{
     Options,
     Matches
 };
-
-#[cfg(not(feature = "backend_scopex"))]
-use std::io::IsTerminal;
-
-cfg_if! {
-    if #[cfg(feature = "backend_run0")] {
-        use std::os::unix::ffi::OsStrExt;
-        use std::path::PathBuf;
-        
-    } else if #[cfg(feature = "backend_scopex")] {
-        use std::path::Path;
-    }
-}
 
 /**
  * A structure to store available options
@@ -144,14 +148,13 @@ fn get_argv_options() -> Options {
     return argv_opt;
 }
 
-
 /**
  * Constructs the initial `systemd-run` argument vector.
  * The UID placeholder (index 2) is later replaced dynamically
  * when the target user is resolved.
  */
 #[cfg(not(feature = "backend_scopex"))]
-fn get_argv() -> Vec<std::ffi::CString> {
+fn build_argv() -> Vec<CString> {
     let mut argv = vec![
         cstring!(match option_env!("RUNAS_SYSTEMD_PATH") {
             Some(path) => path,
@@ -159,200 +162,27 @@ fn get_argv() -> Vec<std::ffi::CString> {
         })
     ];
 
-    cfg_if! {
-        if #[cfg(feature = "backend_run0")] {
-            argv.extend([
-                cstring!("run0"),
-                cstring!("--user"), cstring!(EMPTY),      // MUST be in this order
-                cstring!("--shell-prompt-prefix="),    // Remove the stupid SuperUser icon
-                cstring!("--background=")              // Remove the annoying red background
-            ]);
-        } else {
-            argv.extend([
-                cstring!("systemd-run"),
-                cstring!("--uid"), cstring!(EMPTY), // MUST be in this order
-                cstring!("--quiet"),
-                cstring!("-G"),
-                cstring!("--send-sighup"),
-                cstring!("--same-dir"),
-                
-                #[cfg(not(feature = "without_expand_env"))]
-                cstring!("--expand-environment=false")
-            ]);
-        }
-    }
+    #[cfg(feature = "backend_run0")]
+    argv.extend([
+        cstring!("run0"),
+        cstring!("--user"), cstring!("0"),      // MUST be in this order
+        cstring!("--shell-prompt-prefix="),     // Remove the stupid SuperUser icon
+        cstring!("--background=")               // Remove the annoying red background
+    ]);
+
+    #[cfg(not(feature = "backend_run0"))]
+    argv.extend([
+        cstring!("systemd-run"),
+        cstring!("--uid"), cstring!("0"),       // MUST be in this order
+        cstring!("--quiet"),
+        cstring!("-G"),
+        cstring!("--send-sighup"),
+        
+        #[cfg(not(feature = "without_expand_env"))]
+        cstring!("--expand-environment=false")
+    ]);
 
     return argv;
-}
-
-/**
- * Add or override environment variables from the file '/etc/runas.env'. 
- *
- * The structure of the file is as follows:
- *      USER NAME=VALUE
- *
- * This will set the environment NAME=VALUE when target user matches USER. 
- * Multiple variables can be set for multiple users, one variable per line.
- */
-fn load_env_override(
-    target_name: &str,
-    target_uid: Uid,
-    target_group: &str,
-    target_gid: Gid,
-    envp: &mut Vec<CString>
-) {
-    let file = match File::open("/etc/runas.env") {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            eprintln!("runas: failed to open /etc/runas.env: {e}");
-            return;
-        }
-    };
-    
-    // Validate permissions/ownership
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        let meta = match file.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("runas: failed to stat /etc/runas.env: {e}");
-                return;
-            }
-        };
-
-        // Must be owned by root
-        if meta.uid() != 0 {
-            eprintln!("runas: ignoring /etc/runas.env (not owned by root)");
-            return;
-        }
-
-        // Must not be group/world writable
-        if meta.mode() & 0o022 != 0 {
-            eprintln!("runas: ignoring /etc/runas.env (writable by group or others)");
-            return;
-        }
-    }
-    
-    let reader = BufReader::new(file);
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => errx!(1, e)
-        };
-        
-        let line = line.trim();
-        
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let mut parts = line.splitn(2, char::is_whitespace);
-
-        let name = match parts.next() {
-            Some(v) => v,
-            None => continue,
-        };
-        
-        if name != "*" && name != target_name {
-            continue;
-        }
-        
-        let val = match parts.next() {
-            Some(v) => v.trim_start(),
-            None => continue,
-        };
-        
-        // Validate VAR=VALUE format
-        let (key, value) = match val.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim()),
-            None => continue,
-        };
-
-        // Validate environment variable name
-        if key.is_empty() {
-            continue;
-        }
-
-        if !key.bytes().enumerate().all(|(i, b)| {
-            match b {
-                b'A'..=b'Z' |
-                b'a'..=b'z' |
-                b'_' => true,
-
-                b'0'..=b'9' => i != 0,
-
-                _ => false
-            }
-        }) {
-            continue;
-        }
-        
-        // Expand placeholders
-        let value = value
-            .replace("${USER}", target_name)
-            .replace("${UID}", &target_uid.as_raw().to_string())
-            .replace("${GROUP}", target_group)
-            .replace("${GID}", &target_gid.as_raw().to_string());
-
-        cfg_if! {
-            if #[cfg(not(feature = "backend_scopex"))] {
-                envp.push(cstring!("--setenv"));
-            }
-        }
-        
-        envp.push(
-            cstring!("{}={}", key, value)
-        );
-    }
-}
-
-/** 
- *  Build a complete environment list for execve.
- * 
- *  This creates a new environment vector starting with essential defaults
- *  and retained host variables (`TERM`, `DISPLAY`, `SSH_AUTH_SOCK`, etc.),
- *  then appends all entries from PAM.  
- *  If PAM defines the same variable later, it takes precedence.
- */
-#[cfg(feature = "backend_scopex")]
-pub fn build_environment(
-    envp: &mut Vec<CString>,
-    pam_envp: &[String],
-    preserve: &[&str],
-    target_shell: &str,
-    target_name: &str,
-    target_home: &str,
-) { 
-    // --- Preserve selected variables from current process ---
-    for key in preserve {
-        if let Ok(val) = env::var(key) {
-            envp.push(
-                cstring!("{}={}", key, val)
-            );
-        }
-    }
-
-    // Append everything from PAM
-    for val in pam_envp {
-        envp.push(
-            cstring!(&**val)
-        );
-    }
-    
-    envp.push(
-        cstring!("SHELL={}", target_shell)
-    );
-    
-    envp.push(
-        cstring!("USER={}", target_name)
-    );
-    
-    envp.push(
-        cstring!("HOME={}", target_home)
-    );
 }
 
 /**
@@ -362,38 +192,22 @@ pub fn build_environment(
  * 2. Authenticates user credentials
  * 3. Builds `systemd-run` command argv
  * 4. Executes it with appropriate privileges
- *
- * Exits immediately on error via `errx!()`.
  */
-fn main() -> Infallible {
-    cfg_if! {
-        if #[cfg(feature = "backend_scopex")] {
-            let mut envp:     Vec<CString>   = vec![cstring!("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")];
-            let mut argv_out                 = Vec::new();
-            let mut chdir:    Option<String> = None;
-            
-        } else {
-            let mut argv_out: Vec<CString> = get_argv();
-        }
-    }
+fn main() -> Result<(), Error> {
+    let argv_raw: Vec<String> = env_args().collect();
+    let argv_opt: Options     = get_argv_options();
 
-    let     argv_in:   Vec<String>      = env::args().collect();
-    let     argv_opt:  Options          = get_argv_options();
-    let mut flags:     RunFlags         = RunFlags::NONE;
-    let mut group_obj: Option<Group>    = None;
-    let mut accnt_obj: Option<Account>  = None;
-    
-    let argv_parsed: Matches = match argv_opt.parse(&argv_in[1..]) {
+    let argv_in: Matches = match argv_opt.parse(&argv_raw[1..]) {
         Ok(m) => m,
         Err(e) => {
-            print_usage(&*argv_in[0], &argv_opt);
-            errx!(1, e);
+            print_usage(&*argv_raw[0], &argv_opt);
+            return Err(Error::Message(e.to_string()));
         }
     };
-    
-    let shell = argv_parsed.opt_present("s");
-    let help  = argv_parsed.opt_present("h");
-    let ver   = argv_parsed.opt_present("v");
+
+    let shell = argv_in.opt_present("s");
+    let help  = argv_in.opt_present("h");
+    let ver   = argv_in.opt_present("v");
 
     let special_count =
         shell as u8 +
@@ -401,196 +215,209 @@ fn main() -> Infallible {
         ver as u8;
         
     if special_count > 1 {
-        errx!(1, "Options -s, -h and -v are mutually exclusive");
+        return Err(Error::StaticMessage("Options -s, -h and -v are mutually exclusive"));
         
-    } else if (help || ver || shell) && !argv_parsed.free.is_empty() {
-        errx!(1, "This option does not accept command arguments");
+    } else if (help || ver || shell) && !argv_in.free.is_empty() {
+        return Err(Error::StaticMessage("This option does not accept command arguments"));
         
-    } else if !shell && !help && !ver && argv_parsed.free.is_empty() {
-        errx!(1, "No command specified");
+    } else if !shell && !help && !ver && argv_in.free.is_empty() {
+        return Err(Error::StaticMessage("No command specified"));
     }
-    
-    // Define environment variables to preserve
+
+    let mut env:            HashMap<String, String> = HashMap::new();
+    let mut target_group:   Option<Group>           = None;
+    let mut target_account: Option<Account>         = None;
+    let mut flags:          RunFlags                = RunFlags::NONE;
+    let mut argv:           Vec<CString>            = {
+        #[cfg(not(feature = "backend_scopex"))]
+        {
+            build_argv()
+        }
+
+        #[cfg(feature = "backend_scopex")]
+        {
+            Vec::new()
+        }
+    };
+
     #[cfg(feature = "backend_scopex")]
-    let preserve: Vec<&str> = vec![
-        "TERM",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "SSH_AUTH_SOCK",
-        "XAUTHORITY",
-        "COLORTERM",
-        "LANG"
-    ];
-    
-    for cli_opt in ARGV_SCHEME {
-        if argv_parsed.opt_present(cli_opt.name) {
-            match *cli_opt {
+    let mut target_dir: Option<String> = None;
+
+    for opt in ARGV_SCHEME {
+        if argv_in.opt_present(opt.name) {
+            match *opt {
                 OPT_HELP => {
-                    print_usage(&argv_in[0], &argv_opt);
-                    std::process::exit(0);
+                    print_usage(&argv_raw[0], &argv_opt);
+                    return Ok(());
                 }
-                
+
+                OPT_VERSION => {
+                    #[cfg(any(
+                        feature = "use_pam", 
+                        feature = "backend_scopex", 
+                        feature = "backend_run0"
+                    ))]
+                    {
+                        let mut feat: Vec<&'static str> = Vec::new();
+
+                        #[cfg(feature = "use_pam")]
+                        feat.push("PAM");
+
+                        #[cfg(feature = "backend_scopex")]
+                        feat.push("SCOPEX");
+
+                        #[cfg(feature = "backend_run0")]
+                        feat.push("RUN0");
+
+                        println!(
+                            "{} {} {}",
+                            env!("CARGO_PKG_NAME"),
+                            env!("CARGO_PKG_VERSION"),
+                            feat.join(",")
+                        );
+                    }
+
+                    #[cfg(not(any(
+                        feature = "use_pam", 
+                        feature = "backend_scopex", 
+                        feature = "backend_run0"
+                    )))]
+                    {
+                        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+                    }
+
+                    return Ok(());
+                }
+
                 OPT_USER => {
-                    let cli_value: String = argv_parsed.opt_str(cli_opt.name).unwrap_or_else(|| {
-                        errx!(1, "User was not suplied");
-                    });
+                    let value = argv_in
+                        .opt_str(opt.name)
+                        .ok_or(Error::StaticMessage("User was not supplied"))?;
                     
-                    accnt_obj = Account::from(&cli_value);
+                    target_account = Account::from(&value)?;
                     
-                    if accnt_obj.is_none() {
-                        errx!(1, "User {} is not valid", cli_value);
+                    if target_account.is_none() {
+                        return Err(Error::Message(format!("User {} is not valid", value)));
+                    }
+
+                    #[cfg(not(feature = "backend_scopex"))]
+                    {
+                        argv[3] = cstring!(cstring!(value));
                     }
                 }
-                
+
                 OPT_GROUP => {
-                    let cli_value: String = argv_parsed.opt_str(cli_opt.name).unwrap_or_else(|| {
-                        errx!(1, "Group was not suplied");
-                    });
+                    let value = argv_in
+                        .opt_str(opt.name)
+                        .ok_or(Error::StaticMessage("Group was not supplied"))?;
                     
-                    group_obj = Group::from(&cli_value);
+                    target_group = Group::from(&value)?;
                     
-                    if group_obj.is_none() {
-                        errx!(1, "Group {} is not valid", cli_value);
+                    if target_group.is_none() {
+                        return Err(Error::Message(format!("Group {} is not valid", value)));
                     }  
                     
                     #[cfg(not(feature = "backend_scopex"))]
-                    if !group_obj.is_none() {
-                        cfg_if! {
-                            if #[cfg(feature = "backend_run0")] {
-                                argv_out.push(cstring!("--group"));
-                            
-                            } else {
-                                argv_out.push(cstring!("--gid"));
-                            }
-                        }
+                    if !target_group.is_none() {
+                        #[cfg(feature = "backend_run0")]
+                        argv.push(cstring!("--group"));
 
-                        argv_out.push(cstring!(cli_value));
+                        #[cfg(not(feature = "backend_run0"))]
+                        argv.push(cstring!("--gid"));
+
+                        argv.push(cstring!(value));
                     }
                 }
-                
-                OPT_VERSION => {
-                    cfg_if! {
-                        if #[cfg(all(feature = "use_pam", feature = "backend_scopex"))] {
-                            println!("{} {} PAM,SCOPEX", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                            
-                        } else if #[cfg(all(feature = "use_pam", feature = "backend_run0"))] {
-                            println!("{} {} PAM,RUN0", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                        
-                        } else if #[cfg(feature = "use_pam")] {
-                            println!("{} {} PAM", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                            
-                        } else if #[cfg(feature = "backend_scopex")] {
-                            println!("{} {} SCOPEX", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                        
-                        } else if #[cfg(feature = "backend_run0")] {
-                            println!("{} {} RUN0", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                        
-                        } else {
-                            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-                        }
-                    }
 
-                    std::process::exit(0);
-                }
-                
                 OPT_ENV => {
-                    let cli_value: String = argv_parsed.opt_str(cli_opt.name).unwrap_or_else(|| {
-                        errx!(1, "Missing environment variable");
-                    });
-                    
-                    cfg_if! {
-                        if #[cfg(feature = "backend_scopex")] {
-                            envp.push(
-                                cstring!(cli_value)
-                            );
-                        
-                        } else {
-                            argv_out.push(cstring!("--setenv"));
-                            argv_out.push(cstring!(cli_value));
-                        }
-                    }
+                    let value = argv_in
+                        .opt_str(opt.name)
+                        .ok_or(Error::StaticMessage("Missing environment variable"))?;
+
+                    let (name, value) = value
+                        .split_once('=')
+                        .ok_or(Error::StaticMessage("Missing environment list"))?;
+
+                    env.insert(name.to_owned(), value.to_owned());
                 }
-                
+
                 OPT_PRESERVE => {
-                    let cli_value: String = argv_parsed.opt_str(cli_opt.name).unwrap_or_else(|| {
-                        errx!(1, "Missing environment list");
-                    });
+                    let value = argv_in
+                        .opt_str(opt.name)
+                        .ok_or(Error::StaticMessage("Missing environment list"))?;
                 
-                    for raw in cli_value.split(',') {
+                    for raw in value.split(',') {
                         let name: &str = raw.trim();
                         
                         if !name.is_empty() {
-                            if let Ok(val) = env::var(name) {
-                                cfg_if! {
-                                    if #[cfg(feature = "backend_scopex")] {
-                                        envp.push(
-                                            cstring!("{}={}", name, val)
-                                        );
-                                    
-                                    } else {
-                                        argv_out.push(cstring!("--setenv"));
-                                        argv_out.push(cstring!("{}={}", name, val));
-                                    }
-                                }
+                            if let Ok(val) = env_var(name) {
+                                env.insert(name.to_owned(), val);
                             }
                         }
                     }
                 }
-                
+
                 OPT_CHDIR => {
-                    let cli_value: String = argv_parsed.opt_str(cli_opt.name).unwrap_or_else(|| {
-                        errx!(1, "No path was defined for working directory");
-                    });
-                    
-                    cfg_if! {
-                        if #[cfg(feature = "backend_run0")] {
-                            argv_out.push(cstring!("--chdir"));
-                            argv_out.push(cstring!(cli_value));
-                            
-                        } else if #[cfg(not(feature = "backend_scopex"))] {    
-                            argv_out.push(cstring!("--working-directory"));
-                            argv_out.push(cstring!(cli_value));
-                            
-                        } else {
-                            chdir = Some(cli_value);
+                    let value = argv_in
+                        .opt_str(opt.name)
+                        .ok_or(Error::StaticMessage("No path was defined for working directory"))?;
+
+                    #[cfg(not(feature = "backend_scopex"))]
+                    {
+                        #[cfg(feature = "backend_run0")]
+                        {
+                            argv.push(cstring!("--chdir"));
                         }
+
+                        #[cfg(not(feature = "backend_run0"))]
+                        {
+                            argv.push(cstring!("--working-directory"));
+                        }
+
+                        argv.push(cstring!(value));
+                    }
+
+
+                    #[cfg(feature = "backend_scopex")]
+                    {
+                        target_dir = Some(value);
                     }
                 }
-                
-                OPT_SHELL => flags |= RunFlags::SHELL,
-                OPT_STDIN => flags |= RunFlags::AUTH_STDIN,
+
+                OPT_SHELL  => flags |= RunFlags::SHELL,
+                OPT_STDIN  => flags |= RunFlags::AUTH_STDIN,
                 OPT_NONINT => flags |= RunFlags::AUTH_NO_PROMPT,
                 
                 _ => NULL
             }
         }
     }
-    
+
     // Create selected user account or set it to root if not set via argv
-    let user: Account = Account::current().unwrap_or_else(|| { 
-        errx!(1, "Failed to initialize current user"); 
-    });
+    let current_user: Account = Account::current()?.ok_or(
+        Error::StaticMessage("Failed to initialize current user")
+    )?;
     
     // Get declared target or assume root
-    let mut target: Account = if let Some(account) = accnt_obj { 
+    let mut target_user: Account = if let Some(account) = target_account { 
         account 
     } else {
-        Account::from("0").unwrap_or_else(|| { 
-            errx!(1, "Failed to initialize default user"); 
-        })
+        Account::from("0")?.ok_or(
+            Error::StaticMessage("Failed to initialize default user")
+        )?
     };
     
     // If we have a different gid in argv, update the group
-    if let Some(group) = group_obj {
-        target.set_group(group);
+    if let Some(group) = target_group {
+        target_user.set_group(group);
     }
-    
+
     // Get the currently used shell, fallback to sh
     #[cfg(feature = "backend_scopex")]
-    let target_shell: String = match env::var("SHELL") {
+    let target_shell: String = match env_var("SHELL") {
         Ok(val) if !val.trim().is_empty() => val,
         _ => {
-            let s: &str = user.shell().trim();
+            let s: &str = target_user.shell().trim();
             
             if !s.is_empty() {
                 s.to_string()
@@ -600,158 +427,160 @@ fn main() -> Infallible {
             }
         }
     };
-    
+
     #[cfg(feature = "backend_run0")]
-    if !argv_out.iter().any(|arg| arg.to_str() == Ok("--chdir")) {
-        let path: Result<PathBuf, _> = env::current_dir();
+    if !argv.iter().any(|arg| arg.to_str() == Ok("--chdir")) {
+        let path: Result<PathBuf, _> = env_current_dir();
     
         if let Ok(cwd) = path {
-            argv_out.push(cstring!("--chdir"));
-            argv_out.push(cstring!(
+            argv.push(cstring!("--chdir"));
+            argv.push(cstring!(
                 cwd.as_os_str().as_bytes()
             ));
         }
     }
-    
-    // Do some last systemd-run configuration
+
+    #[cfg(not(any(feature = "backend_scopex", feature = "backend_run0")))]
+    if !argv.iter().any(|arg| arg.to_str() == Ok("--chdir")) {
+        argv.push(cstring!("--same-dir"));
+    }
+
+    // Configure environment and target execution
     if (flags & RunFlags::SHELL) != RunFlags::NONE {
-        if argv_parsed.free.len() > 0 {
-            errx!(1, "Not expecting arguments with the --shell option");
+        if argv_in.free.len() > 0 {
+            return Err(Error::StaticMessage("Not expecting arguments with the --shell option"));
             
         } else if (flags & RunFlags::AUTH_STDIN) != RunFlags::NONE {
-            errx!(1, "The --stdin option is not allowed combined with the --shell option");
+            return Err(Error::StaticMessage("The --stdin option is not allowed combined with the --shell option"));
         }
 
-        cfg_if! {
-            if #[cfg(feature = "backend_scopex")] {    
-                // We only want the name, so make a login shell, e.g. 
-                //      /bin/bash      -> -bash
-                //      /usr/bin/zsh   -> -zsh
-                //      /bin/sh        -> -sh
-                let shell_name = Path::new(&*target_shell)
-                    .file_name()
-                    .unwrap()
-                    .to_string_lossy();
-                    
-                argv_out.push(
-                    cstring!(&*target_shell)
-                );
-
-                argv_out.push(
-                    cstring!("-{}", shell_name)
-                );
+        #[cfg(feature = "backend_scopex")]
+        {
+            // We only want the name, so make a login shell, e.g. 
+            //      /bin/bash      -> -bash
+            //      /usr/bin/zsh   -> -zsh
+            //      /bin/sh        -> -sh
+            let shell_name = Path::new(&*target_shell)
+                .file_name()
+                .unwrap()
+                .to_string_lossy();
                 
-            } else if #[cfg(not(feature = "backend_run0"))] {
-                argv_out.push(cstring!("--shell"));
-                argv_out.push(cstring!("--scope"));
-            }
+            argv.push(
+                cstring!(&*target_shell)
+            );
+
+            argv.push(
+                cstring!("-{}", shell_name)
+            );
         }
-    
+
+        #[cfg(not(any(feature = "backend_run0", feature = "backend_scopex")))]
+        {
+            argv.push(cstring!("--shell"));
+            argv.push(cstring!("--scope"));
+        }
+
     } else {
-        cfg_if! {
-            if #[cfg(feature = "backend_scopex")] {
-                let parts: Option<(&String, &[String])> = argv_parsed.free.split_first();
-            
-                // Copy all of the argv that execvp() should run
-                if let Some((first, rest)) = parts {
-                    argv_out.push(
-                        cstring!(&**first)
-                    );
-                    
-                    argv_out.push(
-                        cstring!(&**first)
-                    );
-                    
-                    // Push all remaining arguments
-                    for opt in rest {
-                        argv_out.push(
-                            cstring!(&**opt)
-                        );
-                    }
-                }
-            
-            } else {
-                if std::io::stdout().is_terminal()
-                        && std::io::stderr().is_terminal()
-                        && std::io::stdin().is_terminal()
-                {
-                    argv_out.push(cstring!("--pty"));
-                } else {
-                    argv_out.push(cstring!("--pipe"));
-                }
-                
-                cfg_if! {
-                    if #[cfg(not(feature = "backend_run0"))] {
-                        argv_out.push(cstring!("--service-type=exec"));
-                        argv_out.push(cstring!("--wait"));
-                    }
-                }
-                
-                argv_out.push(cstring!("--"));
-                
-                // Copy all of the argv that systemd-run should execute
-                for opt in argv_parsed.free {
-                    argv_out.push(cstring!(opt));
-                }
-            }
-        }
-    }
-    
-    // Set the uid that systemd-run should use
-    cfg_if! {
-        if #[cfg(not(feature = "backend_scopex"))] {
-            argv_out[3] = cstring!(target.uid().to_string());
-        }
-    }
-    
-    let result: AuthType = authenticate(&user, &target, flags);
-    
-    // Authenticate the current user, the target user and spawn the process
-    if result.is_true() {
-        cfg_if! {
-            if #[cfg(feature = "backend_scopex")] {
-                let pam_envp: Vec<String> = result.unwrap();
-            
-                // Build environment
-                build_environment(
-                    &mut envp,
-                    &pam_envp,
-                    &preserve,
-                    &*target_shell,
-                    target.name(),
-                    target.home()
-                );
-                
-                // Load override variables
-                load_env_override(
-                    target.name(),
-                    target.uid(),
-                    target.group().name(),
-                    target.gid(),
-                    &mut envp
-                );
-            
-                // Launch the process
-                return exec(&user, &target, &argv_out[0], &argv_out[1..], &envp, &chdir);
-            
-            } else {
-                // Load override variables
-                load_env_override(
-                    target.name(),
-                    target.uid(),
-                    target.group().name(),
-                    target.gid(),
-                    &mut argv_out
-                );
-                
-                // Launch Systemd
-                return exec(&user, &argv_out[0], &argv_out[1..]);
-            }
-        }
+        #[cfg(feature = "backend_scopex")]
+        {
+            let parts: Option<(&String, &[String])> = argv_in.free.split_first();
         
-        // We should never reach this point
+            // Copy all of the argv that execvp() should run
+            if let Some((first, rest)) = parts {
+                argv.push(
+                    cstring!(&**first)
+                );
+                
+                argv.push(
+                    cstring!(&**first)
+                );
+                
+                // Push all remaining arguments
+                for opt in rest {
+                    argv.push(
+                        cstring!(&**opt)
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(feature = "backend_scopex"))]
+        {
+            if stdout().is_terminal()
+                    && stderr().is_terminal()
+                    && stdin().is_terminal()
+            {
+                argv.push(cstring!("--pty"));
+            } else {
+                argv.push(cstring!("--pipe"));
+            }
+
+            #[cfg(not(feature = "backend_run0"))]
+            {
+                argv.push(cstring!("--service-type=exec"));
+                argv.push(cstring!("--wait"));
+            }
+        }
     }
 
-    errx!(1, "Authentication failed")
-}
+    #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+    let result = authenticate(&current_user, &target_user, flags)?;
 
+    #[cfg(not(all(feature = "backend_scopex", feature = "use_pam")))]
+    authenticate(&current_user, &target_user, flags)?;
+
+    let uid = target_user.uid().as_raw().to_string();
+    let gid = target_user.gid().as_raw().to_string();
+
+    let placeholders = [
+        ("USER",  target_user.name()),
+        ("GROUP", target_user.group().name()),
+        ("UID",   uid.as_str()),
+        ("GID",   gid.as_str())
+    ];
+
+    if let Err(err) = load_overwrite_vars(ENV_FILE, &target_user, Some(&placeholders), &mut env) {
+        return Err(err);
+    }
+
+    #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+    for (name, value) in result {
+        env.entry(name).or_insert(value);
+    }
+
+    #[cfg(feature = "backend_scopex")]
+    set_environment(&target_user, &mut env);
+
+    #[cfg(not(feature = "backend_scopex"))]
+    {
+        for (name, value) in env {
+            argv.push(cstring!("--setenv"));
+            argv.push(cstring!("{}={}", name, value));
+        }
+
+        if (flags & RunFlags::SHELL) == RunFlags::NONE {
+            argv.push(cstring!("--"));
+            
+            // Copy all of the argv that systemd-run should execute
+            for opt in argv_in.free {
+                argv.push(
+                    cstring!(opt)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "backend_scopex")]
+    let envp: Vec<CString> = env
+        .into_iter()
+        .map(|(name, value)| cstring!("{}={}", name, value))
+        .collect();
+
+    #[cfg(feature = "backend_scopex")]
+    exec(&current_user, &target_user, &argv[0], &argv[1..], &envp, target_dir)?;
+
+    #[cfg(not(feature = "backend_scopex"))]
+    exec(&current_user, &argv[0], &argv[1..])?;
+
+    Ok(())
+}

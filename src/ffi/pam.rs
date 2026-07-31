@@ -33,25 +33,32 @@
  * C library, but every call is validated and checked at the boundary.
  */
 
-use crate::shared::*;
-use std::cell::Cell;
+use crate::modules::error::Error;
 use zeroize::Zeroize;
-use std::ffi::CStr;
-
-use std::panic::{
-    AssertUnwindSafe, 
-    catch_unwind
-};
-
-use crate::cstring;
+use bitflags::bitflags;
     
 use std::{
     mem, 
     ptr,
-    slice
+    slice,
+    collections::HashMap,
+    cell::{
+        Cell
+    },
+    ffi::{
+        CStr,
+        CString
+    },
+    panic::{
+        AssertUnwindSafe,
+        catch_unwind
+    },
+    io::{
+        Error as IOError
+    }
 };
     
-use nix::libc::{
+use libc::{
     c_char,
     c_int, 
     c_void, 
@@ -69,7 +76,7 @@ use nix::libc::{
 
 mod c_ffi {    
 
-    use nix::libc::{
+    use libc::{
         c_int, 
         c_char, 
         c_void
@@ -93,6 +100,7 @@ mod c_ffi {
         pub fn pam_open_session(pamh: *mut pam_handle_t, flags: c_int) -> c_int;
         pub fn pam_close_session(pamh: *mut pam_handle_t, flags: c_int) -> c_int;
         pub fn pam_set_item(pamh: *mut pam_handle_t, item_type: c_int, item: *const c_void) -> c_int;
+        pub fn pam_strerror(pamh: *mut pam_handle_t, errnum: c_int) -> *const c_char;
     }
 }
 
@@ -112,15 +120,38 @@ mod bindings {
 pub use bindings::*;
 
 /**
+ *
+ */
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PamError {
+    code: u32,
+    message: String,
+}
+
+impl PamError {
+    pub fn new(code: u32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> u32 {
+        self.code
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/**
  * Defines the message types emitted during PAM conversation callbacks.
  */
-#[allow(non_camel_case_types)]
 #[derive(PartialEq)]
-pub enum CONV {
-    ECHO_ON,
-    ECHO_OFF,
-    MSG,
-    ERROR
+pub enum PromptMode {
+    Visible,
+    Hidden,
 }
 
 /**
@@ -129,9 +160,10 @@ pub enum CONV {
  * Implementations of this trait receive messages and prompts
  * during authentication and respond accordingly.
  */
-pub trait PamConv {
-    fn prompt(&mut self, msg: &str, style: CONV) -> Result<String, NULL>;
-    fn msg(&mut self, msg: &str, style: CONV);
+pub trait Conversation {
+    fn prompt(&mut self, message: &str, mode: PromptMode) -> Result<String, Error>;
+    fn info(&mut self, message: &str) -> Result<(), Error>;
+    fn error(&mut self, message: &str) -> Result<(), Error>;
 }
 
 // -------------------------
@@ -150,16 +182,16 @@ impl PamResponses {
     /**
      * 
      */
-    fn new(count: usize) -> Option<Self> {
+    fn new(count: usize) -> Result<Self, Error> {
         let ptr = unsafe {
             calloc(count as size_t, mem::size_of::<pam_response>() as size_t) as *mut pam_response
         };
 
         if ptr.is_null() {
-            None
-        } else {
-            Some(Self { ptr, count })
+            return Err(Error::Io(IOError::last_os_error()))
         }
+
+        Ok(Self { ptr, count })
     }
 
     /**
@@ -224,9 +256,13 @@ impl Drop for PamResponses {
  *
  * Called internally by PAM through the `pam_conv` structure.
  * Performs string decoding, allocates a response array, and invokes the
- * user-defined callback. Errors are mapped to PAM_CONV_ERR.
+ * user-defined callback. 
+ *
+ * Since we can't send Rust Errors through PAM via C and back to Rust, 
+ * any none Error::Pam are written to stderr and normal PAM response
+ * are sent back to PAM. 
  */
-unsafe extern "C" fn pam_conv_process<T: PamConv>(
+unsafe extern "C" fn pam_conv_process<T: Conversation>(
         num_msg: c_int, 
         msg: *mut *const pam_message, 
         resp: *mut *mut pam_response, 
@@ -247,8 +283,11 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
     }
 
     let mut replies = match PamResponses::new(num_msg as usize) {
-        Some(replies) => replies,
-        None => return PAM_BUF_ERR as c_int,
+        Ok(replies) => replies,
+        Err(err) => {
+            eprintln!("PAM allocation error: {}", err);
+            return PAM_BUF_ERR as c_int
+        }
     };
 
     let callback = unsafe {
@@ -261,6 +300,7 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
         };
         
         if request_ptr.is_null() {
+            eprintln!("PAM conversation error: null request pointer");
             return PAM_CONV_ERR as c_int;
         }
         
@@ -269,12 +309,16 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
         };
         
         let msg = if request.msg.is_null() {
-            EMPTY
+            eprintln!("PAM conversation error: null message pointer");
+            return PAM_CONV_ERR as c_int;
             
         } else {
             match unsafe { CStr::from_ptr(request.msg) }.to_str() {
                 Ok(message) => message,
-                Err(_) => return PAM_CONV_ERR as c_int,
+                Err(err) => {
+                    eprintln!("PAM conversation error: {}", err);
+                    return PAM_CONV_ERR as c_int
+                }
             }
         };
         
@@ -284,15 +328,19 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
             
                 let style = if request.msg_style as u32 == PAM_PROMPT_ECHO_ON
                         && !msg.to_lowercase().contains("password") {
-                    CONV::ECHO_ON
+                    PromptMode::Visible
                 } else {
-                    CONV::ECHO_OFF
+                    PromptMode::Hidden
                 };
                 
-                let zero_out = style == CONV::ECHO_OFF;
+                let zero_out = style == PromptMode::Hidden;
                 let answer = match callback.prompt(msg, style) {
                     Ok(answer) => answer,
-                    Err(_) => return PAM_CONV_ERR as c_int,
+                    Err(Error::Pam(err)) => return err.code() as c_int,
+                    Err(err) => {
+                        eprintln!("PAM conversation error: {}", err);
+                        return PAM_CONV_ERR as c_int
+                    }
                 };
 
                 // Consume into bytes
@@ -302,7 +350,7 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
                 bytes.push(0u8);
 
                 // Copy the data using PAM compatible allocator
-                let dup_ptr = unsafe { 
+                let dup_ptr = unsafe {
                     strdup(bytes.as_ptr() as *const c_char) 
                 };
 
@@ -311,7 +359,8 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
                 }
 
                 if dup_ptr.is_null() {
-                    return PAM_BUF_ERR as c_int;
+                    eprintln!("PAM allocation error: {}", IOError::last_os_error());
+                    return PAM_BUF_ERR as c_int
                 }
             
                 /*
@@ -324,14 +373,29 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
             }
             
             PAM_ERROR_MSG => {
-                callback.msg(msg, CONV::ERROR);
+                match callback.error(msg) {
+                    Ok(_) => {}
+                    Err(Error::Pam(err)) => return err.code() as c_int,
+                    Err(err) => {
+                        eprintln!("PAM conversation error: {}", err);
+                        return PAM_CONV_ERR as c_int
+                    }
+                };
             }
             
             PAM_TEXT_INFO => {
-                callback.msg(msg, CONV::MSG);
+                match callback.info(msg) {
+                    Ok(_) => {}
+                    Err(Error::Pam(err)) => return err.code() as c_int,
+                    Err(err) => {
+                        eprintln!("PAM conversation error: {}", err);
+                        return PAM_CONV_ERR as c_int
+                    }
+                };
             }
             
             _ => {
+                eprintln!("PAM conversation error: unknown message style ({})", request.msg_style);
                 return PAM_CONV_ERR as c_int;
             }
         }
@@ -347,7 +411,7 @@ unsafe extern "C" fn pam_conv_process<T: PamConv>(
 /**
  * 
  */
-unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
+unsafe extern "C" fn pam_conv_wrap<T: Conversation>(
     num_msg: c_int,
     msg: *mut *const pam_message,
     resp: *mut *mut pam_response,
@@ -365,12 +429,57 @@ unsafe extern "C" fn pam_conv_wrap<T: PamConv>(
 // Wrapper functions
 // -------------------------
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PamItem {
+    Service      = PAM_SERVICE,
+    User         = PAM_USER,
+    RUser        = PAM_RUSER,
+    Tty          = PAM_TTY,
+    RHost        = PAM_RHOST,
+    Conv         = PAM_CONV,
+    AuthTok      = PAM_AUTHTOK,
+    OldAuthTok   = PAM_OLDAUTHTOK,
+    UserPrompt   = PAM_USER_PROMPT,
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct AuthFlags: u32 {
+        const SILENT                 = PAM_SILENT as u32;
+        const DISALLOW_NULL_AUTHTOK  = PAM_DISALLOW_NULL_AUTHTOK as u32;
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct AccntFlags: u32 {
+        const SILENT = PAM_SILENT as u32;
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct SessionFlags: u32 {
+        const SILENT = PAM_SILENT as u32;
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct AuthTokenFlags: u32 {
+        const SILENT                  = PAM_SILENT as u32;
+        const CHANGE_EXPIRED_AUTHTOK  = PAM_CHANGE_EXPIRED_AUTHTOK as u32;
+    }
+}
+
 /**
  *
  */
 pub struct PamHandle {
     handle: *mut pam_handle_t,
-    result: Cell<u32>,
+    last_status: Cell<c_int>,
     session: Cell<bool>
 }
 
@@ -379,38 +488,77 @@ pub struct PamHandle {
  */
 impl PamHandle {
     /**
+     *
+     */
+    fn check(&self, result: c_int) -> Result<(), Error> {
+        self.last_status.set(result);
+
+        if result as u32 == PAM_SUCCESS {
+            Ok(())
+        } else {
+            Err(Error::Pam(self.error(result)))
+        }
+    }
+
+    /**
+     *
+     */
+    pub fn error(&self, code: c_int) -> PamError {
+        let message = unsafe {
+            let ptr = c_ffi::pam_strerror(self.handle, code);
+
+            if ptr.is_null() {
+                return PamError::new(
+                    PAM_SYSTEM_ERR, 
+                    format!("Unknown error ({code})")
+                );
+            }
+
+            CStr::from_ptr(ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        PamError::new(code as u32, message)
+    }
+
+    /**
      * Authenticate a user associated with the given PAM handle.
      */
-    pub fn authenticate(&self, flags: u32) -> u32 {
-        unsafe {
-            self.result.set(c_ffi::pam_authenticate(self.handle, flags as c_int) as u32);
-        }
-        
-        self.result.get()
+    pub fn authenticate(&self, flags: AuthFlags) -> Result<(), Error> {
+        self.check(unsafe {
+            c_ffi::pam_authenticate(self.handle, flags.bits() as c_int)
+        })
     }
 
     /**
      * Perform PAM account management checks (e.g., expiration, validity).
      */
     #[allow(unused)]
-    pub fn acct_mgmt(&self, flags: u32) -> u32 {
-        unsafe {
-            self.result.set(c_ffi::pam_acct_mgmt(self.handle, flags as c_int) as u32);
+    pub fn acct_mgmt(&self, flags: AccntFlags) -> Result<(), Error> {
+        let result = unsafe {
+            c_ffi::pam_acct_mgmt(self.handle, flags.bits() as c_int)
+        };
+
+        self.last_status.set(result);
+
+        match result as u32 {
+            PAM_SUCCESS => Ok(()),
+            PAM_NEW_AUTHTOK_REQD => {
+                Err(Error::PamActionRequired(self.error(PAM_NEW_AUTHTOK_REQD as c_int)))
+            }
+            result => Err(Error::Pam(self.error(result as c_int))),
         }
-        
-        self.result.get()
     }
     
     /**
      *
      */
     #[allow(unused)]
-    pub fn chauthtok(&self, flags: u32) -> u32 {
-        unsafe {
-            self.result.set(c_ffi::pam_chauthtok(self.handle, flags as c_int) as u32);
-        }
-        
-        self.result.get()
+    pub fn chauthtok(&self, flags: AuthTokenFlags) -> Result<(), Error> {
+        self.check(unsafe {
+            c_ffi::pam_chauthtok(self.handle, flags.bits() as c_int)
+        })
     }
 
     /**
@@ -420,30 +568,22 @@ impl PamHandle {
      * It initializes session modules like pam_systemd, pam_env, etc.
      */
     #[allow(unused)]
-    pub fn open_session(&self, flags: u32) -> u32 {
+    pub fn open_session(&self, flags: SessionFlags) -> Result<(), Error> {
         if self.session.get() {
-            return PAM_SUCCESS;
+            return Ok(());
         }
-    
-        unsafe { 
-            let mut result = c_ffi::pam_setcred(self.handle, PAM_REINITIALIZE_CRED as c_int) as u32;
-            
-            if result == PAM_SUCCESS {
-                result = c_ffi::pam_open_session(self.handle, flags as c_int) as u32;
-                
-                if result != PAM_SUCCESS {
-                    c_ffi::pam_setcred(self.handle, PAM_DELETE_CRED as c_int);
-                }
-            }
-            
-            self.result.set(result);
-        }
-        
-        if self.result.get() == PAM_SUCCESS {
-            self.session.set(true);
-        }
-        
-        self.result.get()
+
+        self.check(unsafe {
+            c_ffi::pam_setcred(self.handle, PAM_ESTABLISH_CRED as c_int)
+        })?;
+
+        self.check(unsafe {
+            c_ffi::pam_open_session(self.handle, flags.bits() as c_int)
+        })?;
+
+        self.session.set(true);
+
+        Ok(())
     }
 
     /**
@@ -452,74 +592,84 @@ impl PamHandle {
      * This should be called once the session process terminates.
      */
     #[allow(unused)]
-    pub fn close_session(&self, flags: u32) -> u32 {
+    pub fn close_session(&self, flags: SessionFlags) -> Result<(), Error> {
         if !self.session.get() {
-            return PAM_SUCCESS;
+            return Ok(());
         }
-    
-        unsafe {
-            let result = c_ffi::pam_close_session(self.handle, flags as c_int) as u32;
-            
-            if result == PAM_SUCCESS {
-                c_ffi::pam_setcred(self.handle, PAM_DELETE_CRED as c_int);
-            }
-            
-            self.result.set(result);
-        }
-        
-        if self.result.get() == PAM_SUCCESS {
-            self.session.set(false);
-        }
-        
-        self.result.get()
+
+        self.check(unsafe {
+            c_ffi::pam_close_session(self.handle, flags.bits() as c_int)
+        })?;
+
+        self.check(unsafe {
+            c_ffi::pam_setcred(self.handle, PAM_DELETE_CRED as c_int)
+        })
     }
     
     /**
      * 
      */
     #[allow(unused)]
-    pub fn set_item(&self, item_type: u32, value: &str) -> u32 {
-        let c_value = cstring!(value);
-    
-        unsafe {
-            self.result.set(c_ffi::pam_set_item(self.handle, item_type as c_int, c_value.as_ptr() as *const c_void) as u32);
-        }
-        
-        self.result.get()
+    pub fn set_item(&self, item_type: PamItem, value: &str) -> Result<(), Error> {
+        let c_value = CString::new(value)?;
+
+        self.check(unsafe {
+            c_ffi::pam_set_item(self.handle, item_type as c_int, c_value.as_ptr() as *const c_void)
+        })
     }
     
     /**
      * Get a list of environment variables from PAM.
      */
     #[allow(unused)]
-    pub fn getenvlist(&self) -> Vec<String> {
-        let mut envs = Vec::new();
+    pub fn getenvlist(&self) -> Result<HashMap<String, String>, Error> {
+        let mut envs = HashMap::new();
 
         unsafe {
             let list = c_ffi::pam_getenvlist(self.handle);
 
             if list.is_null() {
-                return envs;
+                return Ok(envs);
             }
-            
+
+            let mut result: Result<(), Error> = Ok(());
+
             /*
-             * Self note for the future.
-             * *p.add(i) = *(p + i) in C
-             *
-             * One of the most stupid naming conventions ever seen, 
-             * in the history of programming, but that is typical Rust. 
-             */
+            * Self note for the future.
+            * *p.add(i) = *(p + i) in C
+            *
+            * One of the most stupid naming conventions ever seen,
+            * in the history of programming, but that is typical Rust.
+            */
 
             let mut i = 0;
             loop {
                 let entry = *list.add(i);
+
                 if entry.is_null() {
                     break;
                 }
 
-                let c_str = CStr::from_ptr(entry);
-                if let Ok(s) = c_str.to_str() {
-                    envs.push(s.to_owned());
+                match CStr::from_ptr(entry).to_str() {
+                    Ok(s) => {
+                        match s.split_once('=') {
+                            Some((key, value)) => {
+                                envs.insert(key.to_owned(), value.to_owned());
+                            }
+                            
+                            None => {
+                                result = Err(Error::StaticMessage(
+                                    "invalid environment variable returned by PAM",
+                                ));
+                                break;
+                            }
+                        }
+                    }
+
+                    Err(e) => {
+                        result = Err(e.into());
+                        break;
+                    }
                 }
 
                 i += 1;
@@ -532,9 +682,11 @@ impl PamHandle {
                 j += 1;
             }
             free(list as *mut c_void);
+
+            result?;
         }
 
-        envs
+        Ok(envs)
     }
 }
 
@@ -545,16 +697,38 @@ impl Drop for PamHandle {
     fn drop(&mut self) {
         if !self.handle.is_null() {
             if self.session.get() {
-                self.close_session(0);
+                let _ = self.close_session(SessionFlags::empty());
             }
         
             unsafe { 
-                c_ffi::pam_end(self.handle, self.result.get() as c_int);
+                c_ffi::pam_end(self.handle, self.last_status.get());
             }
             
             self.handle = std::ptr::null_mut();
         }
     }
+}
+
+/**
+ *
+ */
+pub fn pam_error(code: c_int) -> PamError {
+    let message = unsafe {
+        let ptr = c_ffi::pam_strerror(std::ptr::null_mut(), code);
+
+        if ptr.is_null() {
+            return PamError::new(
+                PAM_SYSTEM_ERR,
+                format!("Unknown error ({code})")
+            );
+        }
+
+        CStr::from_ptr(ptr)
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    PamError::new(code as u32, message)
 }
 
 /**
@@ -566,30 +740,33 @@ impl Drop for PamHandle {
  *
  * @return PAM handle wrapped in `Result`, or error code on failure.
  */
-pub fn pam_start<T: PamConv>(service: &str, username: &str, conversation: &mut T) -> Result<PamHandle, u32> {
+pub fn pam_start<T: Conversation>(service: &str, username: &str, conversation: &mut T) -> Result<PamHandle, Error> {
     let mut handle: *mut pam_handle_t = std::ptr::null_mut();
-    let     c_service                 = cstring!(service);
-    let     c_username                = cstring!(username);
-    let     result: u32;
+    let     c_service                 = CString::new(service)?;
+    let     c_username                = CString::new(username)?;
     
     let mut conversation = pam_conv {
         conv: Some(pam_conv_wrap::<T>),
         appdata_ptr: conversation as *mut T as *mut c_void
     };
-    
-    unsafe {
-        result = c_ffi::pam_start(c_service.as_ptr(), c_username.as_ptr(), &mut conversation, &mut handle) as u32;
+
+    let result = unsafe {
+        c_ffi::pam_start(c_service.as_ptr(), c_username.as_ptr(), &mut conversation, &mut handle)
+    };
+
+    if result as u32 != PAM_SUCCESS {
+        return Err(Error::Pam(pam_error(result)));
+
+    } else if handle.is_null() {
+        // Should not be possible
+        return Err(Error::StaticMessage("returned null pointer PAM handle"));
     }
-        
-    if result == PAM_SUCCESS && !handle.is_null() {
-        return Ok(
-            PamHandle {
-                handle: handle,
-                result: Cell::new(PAM_SUCCESS),
-                session: Cell::new(false)
-            }
-        );
-    }
-    
-    Err(result)
+
+    Ok(
+        PamHandle {
+            handle: handle,
+            last_status: Cell::new(PAM_SUCCESS as c_int),
+            session: Cell::new(false)
+        }
+    )
 }
