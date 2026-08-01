@@ -191,6 +191,20 @@ fn build_argv() -> Vec<CString> {
 }
 
 /**
+ *
+ */
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+
+        Err(error) => {
+            eprintln!("{}", error);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/**
  * Program entry point.
  *
  * 1. Parses command line arguments
@@ -198,7 +212,7 @@ fn build_argv() -> Vec<CString> {
  * 3. Builds `systemd-run` command argv
  * 4. Executes it with appropriate privileges
  */
-fn main() -> Result<(), Error> {
+fn run() -> Result<(), Error> {
     /*
      * TODO:
      *  - Preserve non-UTF-8 parsing to the target process
