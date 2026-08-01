@@ -426,18 +426,34 @@ fn main() -> Result<(), Error> {
 
     // Get the currently used shell, fallback to sh
     #[cfg(feature = "backend_scopex")]
-    let target_shell: String = match env_var("SHELL") {
-        Ok(val) if !val.trim().is_empty() => val,
-        _ => {
-            let s: &str = target_user.shell().trim();
-            
-            if !s.is_empty() {
-                s.to_string()
-            
-            } else {
-                String::from("/bin/sh")
+    let (target_shell, shell_name) = {
+        let shell = match env_var("SHELL") {
+            Ok(val)
+                if !val.trim().is_empty()
+                    && Path::new(&val).file_name().is_some() =>
+            {
+                val
             }
-        }
+
+            _ => {
+                let s = target_user.shell().trim();
+
+                if !s.is_empty() && Path::new(s).file_name().is_some() {
+                    s.to_string()
+
+                } else {
+                    String::from("/bin/sh")
+                }
+            }
+        };
+
+        let name = Path::new(&shell)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        (shell, name)
     };
 
     #[cfg(feature = "backend_run0")]
@@ -468,19 +484,14 @@ fn main() -> Result<(), Error> {
 
         #[cfg(feature = "backend_scopex")]
         {
-            // We only want the name, so make a login shell, e.g. 
-            //      /bin/bash      -> -bash
-            //      /usr/bin/zsh   -> -zsh
-            //      /bin/sh        -> -sh
-            let shell_name = Path::new(&*target_shell)
-                .file_name()
-                .unwrap()
-                .to_string_lossy();
-                
             argv.push(
                 cstring!(&*target_shell)
             );
 
+            // We only want the name, so make a login shell, e.g. 
+            //      /bin/bash      -> -bash
+            //      /usr/bin/zsh   -> -zsh
+            //      /bin/sh        -> -sh
             argv.push(
                 cstring!("-{}", shell_name)
             );
