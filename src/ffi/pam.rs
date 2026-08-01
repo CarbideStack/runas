@@ -577,9 +577,17 @@ impl PamHandle {
             c_ffi::pam_setcred(self.handle, PAM_ESTABLISH_CRED as c_int)
         })?;
 
-        self.check(unsafe {
+        if let Err(err) = self.check(unsafe {
             c_ffi::pam_open_session(self.handle, flags.bits() as c_int)
-        })?;
+        }) {
+            // Best-effort cleanup. Ignore any error from deleting credentials,
+            // since the original open_session error is the one we want to report.
+            unsafe {
+                c_ffi::pam_setcred(self.handle, PAM_DELETE_CRED as c_int);
+            }
+
+            return Err(err);
+        }
 
         self.session.set(true);
 
@@ -597,9 +605,17 @@ impl PamHandle {
             return Ok(());
         }
 
-        self.check(unsafe {
+        if let Err(err) = self.check(unsafe {
             c_ffi::pam_close_session(self.handle, flags.bits() as c_int)
-        })?;
+        }) {
+            unsafe {
+                c_ffi::pam_setcred(self.handle, PAM_DELETE_CRED as c_int);
+            }
+
+            return Err(err);
+        }
+
+        self.session.set(false);
 
         self.check(unsafe {
             c_ffi::pam_setcred(self.handle, PAM_DELETE_CRED as c_int)
