@@ -24,9 +24,6 @@ use crate::modules::{
     user::Account,
 };
 
-#[cfg(feature = "backend_scopex")]
-use super::path::find_executable;
-
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 use crate::modules::{
     fg_handler::ForegroundHandler,
@@ -41,12 +38,14 @@ use std::{
 
 #[cfg(feature = "backend_scopex")]
 use std::{
-    env::set_current_dir as env_set_current_dir,
+    env::{
+        set_current_dir as env_set_current_dir,
+        var as env_var
+    },
     path::Path,
     io::Error as IOError,
     os::{
-        raw::c_char,
-        unix::ffi::OsStrExt,
+        raw::c_char
     },
 };
 
@@ -63,6 +62,7 @@ use nix::{
         gid_t
     },
     unistd::execve,
+    errno::Errno
 };
 
 #[cfg(not(feature = "backend_scopex"))]
@@ -74,7 +74,6 @@ use nix::unistd::{
 
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 use nix::{
-    errno::Errno,
     sys::{
         signal::{self, Signal},
         wait::{
@@ -217,6 +216,68 @@ fn initgroups(username: &str, gid: gid_t) -> Result<(), Error> {
 }
 
 /**
+ * Execute a command using the caller's PATH, falling back to PATH entries
+ * supplied through envp.
+ */
+#[cfg(feature = "backend_scopex")]
+fn execvpe(
+    cmd: &CString,
+    argv: &[CString],
+    envp: &[CString],
+) -> Result<Infallible, Error> {
+    let command = cmd.to_str()?;
+
+    if command.contains('/') {
+        return execve(cmd, argv, envp).map_err(Error::from);
+    }
+
+    let caller_path = env_var("PATH").ok();
+    let paths = caller_path
+        .iter()
+        .map(String::as_str)
+        .chain(
+            envp.iter().filter_map(|entry| {
+                entry.to_str().ok()?.strip_prefix("PATH=")
+            })
+        );
+
+    let mut permission_denied = false;
+
+    for path in paths {
+        for directory in path.split(':') {
+            if directory.is_empty() {
+                continue;
+            }
+
+            let candidate = Path::new(directory).join(command);
+            let candidate = CString::new(
+                candidate.as_os_str().as_encoded_bytes()
+            )?;
+
+            match execve(&candidate, argv, envp) {
+                Err(Errno::ENOENT | Errno::ENOTDIR) => continue,
+
+                Err(Errno::EACCES) => {
+                    permission_denied = true;
+                }
+
+                Err(error) => {
+                    return Err(Error::from(error));
+                }
+
+                Ok(never) => match never {},
+            }
+        }
+    }
+
+    if permission_denied {
+        Err(Error::from(Errno::EACCES))
+    } else {
+        Err(Error::from(Errno::ENOENT))
+    }
+}
+
+/**
  *
  */
 pub fn exec<
@@ -245,9 +306,6 @@ pub fn exec<
             (Gid::from_raw(0), Uid::from_raw(0))
         }
     };
-
-    #[cfg(feature = "backend_scopex")]
-    let target_cmd = CString::new(find_executable(cmd.to_str()?, envp)?.as_os_str().as_bytes())?;
 
     #[cfg(all(feature = "use_pam", feature = "backend_scopex"))]
     let supervisor = getppid();
@@ -286,6 +344,6 @@ pub fn exec<
             env_set_current_dir(dir)?;
         }
 
-        return execve(&target_cmd, argv, envp).map_err(Error::from);
+        return execvpe(cmd, argv, envp);
     }
 }
