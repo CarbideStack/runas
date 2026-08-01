@@ -63,6 +63,8 @@ use runas::{
 #[cfg(feature = "backend_scopex")]
 use runas::modules::env::set_environment;
 
+use nix::unistd::Uid as CUid;
+
 use std::{
     ffi::CString,
     collections::HashMap,
@@ -402,7 +404,7 @@ fn main() -> Result<(), Error> {
     let mut target_user: Account = if let Some(account) = target_account { 
         account 
     } else {
-        Account::from("0")?.ok_or(
+        Account::from_uid(CUid::from_raw(0))?.ok_or(
             Error::StaticMessage("Failed to initialize default user")
         )?
     };

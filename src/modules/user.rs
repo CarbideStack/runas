@@ -141,6 +141,17 @@ impl User {
         };
 
         if let Some(info) = info {
+            return Self::from_uid(info.uid);
+        }
+
+        return Ok(None);
+    }
+
+    /**
+     * Create a user from a UID.
+     */
+    pub fn from_uid(uid: CUid) -> Result<Option<Self>, Error> {
+        if let Some(info) = CUser::from_uid(uid)? {
             return Ok(Some( 
                 User {
                     gid: info.gid,
@@ -200,14 +211,33 @@ impl Group {
         } else {
             CGroup::from_name(group)?
         };
-        
+
         if let Some(info) = info {
             return Ok(Some( 
                 Group { 
                     gid: info.gid,
                     name: info.name 
                 } 
-           ));
+            ));
+        }
+
+        return Ok(None);
+    }
+
+    /**
+     * Create a group from a name or GID string.
+     *
+     * Accepts either a group name or a numeric GID.
+     * Validates the entry against the system database and returns `Some(Group)` if found.
+     */
+    pub fn from_gid(gid: CGid) -> Result<Option<Self>, Error> {
+        if let Some(info) = CGroup::from_gid(gid)? {
+            return Ok(Some(
+                Group {
+                    gid: info.gid,
+                    name: info.name
+                }
+            ));
         }
         
         return Ok(None);
@@ -277,8 +307,7 @@ impl Account {
      * Get an instance of the current executing account
      */
     pub fn current() -> Result<Option<Self>, Error> {
-        let uid = getuid().as_raw().to_string();
-        Self::from(&uid)
+        Self::from_uid(getuid())
     }
     
     /**
@@ -291,7 +320,26 @@ impl Account {
             return Ok(None);
         };
 
-        let Some(group) = Group::from(&user.gid.to_string())? else {
+        let Some(group) = Group::from_gid(user.gid())? else {
+            return Ok(None);
+        };
+
+        Ok(Some(Account {
+            user,
+            group,
+            group_list: RefCell::new(None),
+        }))
+    }
+
+    /**
+     *
+     */
+    pub fn from_uid(uid: CUid) -> Result<Option<Self>, Error> {
+        let Some(user) = User::from_uid(uid)? else {
+            return Ok(None);
+        };
+
+        let Some(group) = Group::from_gid(user.gid())? else {
             return Ok(None);
         };
 
