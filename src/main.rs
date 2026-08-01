@@ -75,7 +75,10 @@ use std::{
 };
 
 #[cfg(feature = "backend_scopex")]
-use std::path::Path;
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::Path,
+};
 
 #[cfg(not(feature = "backend_scopex"))]
 use std::{
@@ -424,38 +427,6 @@ fn main() -> Result<(), Error> {
         target_user.set_group(group);
     }
 
-    // Get the currently used shell, fallback to sh
-    #[cfg(feature = "backend_scopex")]
-    let (target_shell, shell_name) = {
-        let shell = match env_var("SHELL") {
-            Ok(val)
-                if !val.trim().is_empty()
-                    && Path::new(&val).file_name().is_some() =>
-            {
-                val
-            }
-
-            _ => {
-                let s = target_user.shell().trim();
-
-                if !s.is_empty() && Path::new(s).file_name().is_some() {
-                    s.to_string()
-
-                } else {
-                    String::from("/bin/sh")
-                }
-            }
-        };
-
-        let name = Path::new(&shell)
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
-        (shell, name)
-    };
-
     #[cfg(feature = "backend_run0")]
     if !argv.iter().any(|arg| arg.to_str() == Ok("--chdir")) {
         let path: Result<PathBuf, _> = env_current_dir();
@@ -484,6 +455,45 @@ fn main() -> Result<(), Error> {
 
         #[cfg(feature = "backend_scopex")]
         {
+            let (target_shell, shell_name) = {
+                let mut shell = match env_var("SHELL") {
+                    Ok(val)
+                        if !val.trim().is_empty() =>
+                    {
+                        val
+                    }
+
+                    _ => {
+                        let s = target_user.shell();
+
+                        if !s.trim().is_empty() {
+                            s.to_string()
+
+                        } else {
+                            String::from("/bin/sh")
+                        }
+                    }
+                };
+
+                // Make sure that the shell is actually an existing and working shell
+                if !matches!(
+                    std::fs::metadata(&shell),
+                    Ok(ref metadata)
+                        if metadata.is_file()
+                            && metadata.permissions().mode() & 0o111 != 0
+                ) {
+                    shell = String::from("/bin/sh");
+                }
+
+                let name = Path::new(&shell)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+
+                (shell, name)
+            };
+
             argv.push(
                 cstring!(&*target_shell)
             );
