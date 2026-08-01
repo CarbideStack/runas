@@ -69,7 +69,7 @@ use std::{
     ffi::CString,
     collections::HashMap,
     env::{
-        args as env_args,
+        args_os as env_args,
         var as env_var
     }
 };
@@ -196,7 +196,17 @@ fn build_argv() -> Vec<CString> {
  * 4. Executes it with appropriate privileges
  */
 fn main() -> Result<(), Error> {
-    let argv_raw: Vec<String> = env_args().collect();
+    /*
+     * TODO:
+     *  - Preserve non-UTF-8 parsing to the target process
+     */
+    let argv_raw: Vec<String> = env_args()
+        .map(|arg| {
+            arg.into_string()
+                .map_err(|_| Error::StaticMessage("command-line argument is not valid UTF-8"))
+        })
+        .collect::<Result<_, _>>()?;
+
     let argv_opt: Options     = get_argv_options();
 
     let argv_in: Matches = match argv_opt.parse(&argv_raw[1..]) {
