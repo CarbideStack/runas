@@ -96,6 +96,70 @@ absolute path can be selected at build time using `RUNAS_SYSTEMD_PATH`:
 RUNAS_SYSTEMD_PATH=/custom/path/systemd-run cargo build --release
 ```
 
+## Environment configuration
+
+In addition to `--env` and `--preserve-env`, `runas` can set environment
+variables from `/etc/runas.env`. The file is optional; if it does not exist,
+`runas` continues without an error.
+
+Each non-empty line has the following format:
+
+```text
+TARGET NAME=VALUE
+```
+
+`TARGET` is either the resolved target user name or `*` to match every target
+user. Only one variable can be assigned per line. Blank lines and lines whose
+first non-whitespace character is `#` are ignored.
+
+For example:
+
+```text
+# Applied to every target user
+* EDITOR=/usr/bin/vim
+* RUNAS_TARGET=${USER}
+
+# Applied only when running as root
+root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+
+# Applied only when running as alice
+alice CACHE_DIR=/var/cache/users/${UID}
+alice TARGET_GROUP=${GROUP}
+alice TARGET_GID=${GID}
+```
+
+The following placeholders are replaced using the resolved target account:
+
+| Placeholder | Replacement                         |
+| ----------- | ----------------------------------- |
+| `${USER}`   | Target user name                    |
+| `${GROUP}`  | Target primary or selected group    |
+| `${UID}`    | Numeric target user ID              |
+| `${GID}`    | Numeric target group ID             |
+
+Placeholder replacement is literal. The file is not interpreted by a shell,
+so quoting, command substitution, variable expansion other than the four
+placeholders above, and escape processing are not supported. Leading and
+trailing whitespace around names and values is removed; whitespace inside a
+value is retained.
+
+Variable names must begin with an ASCII letter or underscore and may contain
+only ASCII letters, digits, and underscores. Malformed lines and invalid names
+are skipped. If a variable is assigned more than once, the first applicable
+assignment wins. Values supplied with `--env` or imported with
+`--preserve-env` take precedence over `/etc/runas.env`.
+
+For security, `/etc/runas.env` must be owned by root and must not be writable
+by its group or by other users. A typical setup is:
+
+```bash
+chown root:root /etc/runas.env
+chmod 0644 /etc/runas.env
+```
+
+Failure to read the file, or unsafe ownership or permissions, prevents the
+command from being launched.
+
 ## PAM specifics
 
 When compiled with the `use_pam` feature and using the native executor:
