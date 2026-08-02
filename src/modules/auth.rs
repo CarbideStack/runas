@@ -393,69 +393,89 @@ mod feat {
 }
 
 /**
+ *
+ */
+enum AuthDecision {
+    Allow,
+    Deny,
+    Authenticate,
+}
+
+/**
+ *
+ */
+fn auth_decision(
+    is_root: bool,
+    same_uid: bool,
+    has_target_group: bool,
+    non_interactive: bool
+) -> AuthDecision {
+    /*
+     * The following will evaluate to Allow:
+     *  - The user is root (Can do whatever they want).
+     *  - The user is launching this as it's own UID and primary GID.
+     *  - The user is launching this as it's own UID and a GID that the UID is a member of.
+     *
+     * The following will evaluate to Authenticate:
+     *  - The user tries to switch UID away from it's own.              E.g. --uid
+     *  - The user tries to access a GID that it is not a member of.    E.g. --gid
+     */
+    if is_root || (same_uid && has_target_group) {
+        return AuthDecision::Allow;
+
+    } else if !non_interactive {
+        return AuthDecision::Authenticate;
+    }
+
+    return AuthDecision::Deny;
+}
+
+/**
  * Authenticate a user against a target account.
  *
  * @param user     The invoking account
  * @param target   The target account being accessed
  * @param flags    Runtime authentication flags
- *
- * @return `true` if authentication succeeds or is not required, `false` otherwise.
  */
 pub fn authenticate(user: &Account, target: &Account, flags: RunFlags) -> Result<AuthType, Error> {
-    /*
-     * The following will evaluate to true:
-     *  - The user is root (Can do whatever they want).
-     *  - The user is launching this as it's own UID and primary GID.
-     *  - The user is launching this as it's own UID and a GID that the UID is a member of.
-     *
-     * The following will require authentication:
-     *  - The user tries to switch UID away from it's own.              E.g. --uid
-     *  - The user tries to access a GID that it is not a member of.    E.g. --gid
-     */
-    if user.is_root() || (target.uid() == user.uid()
-                        && (target.gid() == user.gid() || user.is_member(target.group())?)) {
-                         
-        #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-        return feat::auth(
-            user, 
-            target, 
-            flags, 
-            user.is_root() || target.uid() == user.uid()
-        );
+    let non_interactive =
+        flags.contains(RunFlags::AUTH_NO_PROMPT)
+            && !flags.contains(RunFlags::AUTH_STDIN);
 
-        #[cfg(not(all(feature = "backend_scopex", feature = "use_pam")))]
-        return DEFAULT_TRUE;
-        
-    } else if (flags & RunFlags::AUTH_NO_PROMPT) != RunFlags::NONE 
-            && (flags & RunFlags::AUTH_STDIN) == RunFlags::NONE {
-            
-        /*
-         * Password prompt was requested disabled while 
-         * not requesting passing via stdin. 
-         *
-         * We just fail, beause auth() will launch a prompt if stdin is disabled, 
-         * and caller did not want a prompt. 
-         */
-        return DEFAULT_FALSE;
-        
-    } else if let Some(wheel) = Group::from(AUTH_GROUP)? {
-        /*
-         * We only allow the wheel group to reach outside their
-         * own UID and GID's. 
-         */
-        if !user.is_member(&wheel)? {
+    match auth_decision(
+        user.is_root(),
+        target.uid() == user.uid(),
+        target.gid() == user.gid() || user.is_member(target.group())?,
+        non_interactive
+    ) {
+        AuthDecision::Allow => {
+            #[cfg(not(all(feature = "backend_scopex", feature = "use_pam")))]
+            return DEFAULT_TRUE;
+
+            #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+            return feat::auth(user, target, flags, true);
+        }
+
+        AuthDecision::Deny => {
             return DEFAULT_FALSE;
         }
 
-        #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-        return feat::auth(user, target, flags, false);
+        AuthDecision::Authenticate => {
+            let is_wheel_member: bool = if let Some(wheel) = Group::from(AUTH_GROUP)? {
+                user.is_member(&wheel)?
+            } else {
+                false
+            };
 
-        #[cfg(not(all(feature = "backend_scopex", feature = "use_pam")))]
-        return feat::auth(user, flags);
+            if !is_wheel_member {
+                return DEFAULT_FALSE;
+            }
+
+            #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+            return feat::auth(user, target, flags, false);
+
+            #[cfg(not(all(feature = "backend_scopex", feature = "use_pam")))]
+            return feat::auth(user, flags);
+        }
     }
-    
-    /*
-     * Default to false.
-     */
-    DEFAULT_FALSE
 }
