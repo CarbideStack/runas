@@ -66,7 +66,11 @@ use runas::modules::env::set_environment;
 use nix::unistd::Uid as CUid;
 
 use std::{
-    ffi::CString,
+    os::unix::ffi::OsStrExt,
+    ffi::{
+        CString,
+        OsString
+    },
     collections::HashMap,
     env::{
         args_os as env_args,
@@ -93,8 +97,7 @@ use std::{
 #[cfg(feature = "backend_run0")]
 use std::{
     env::current_dir as env_current_dir,
-    path::PathBuf,
-    os::unix::ffi::OsStrExt
+    path::PathBuf
 };
 
 use getopts::{
@@ -213,25 +216,52 @@ fn main() -> std::process::ExitCode {
  * 4. Executes it with appropriate privileges
  */
 fn run() -> Result<(), Error> {
-    /*
-     * TODO:
-     *  - Preserve non-UTF-8 parsing to the target process
-     */
-    let argv_raw: Vec<String> = env_args()
-        .map(|arg| {
-            arg.into_string()
-                .map_err(|_| Error::StaticMessage("command-line argument is not valid UTF-8"))
-        })
-        .collect::<Result<_, _>>()?;
 
-    let argv_opt: Options     = get_argv_options();
+    let argv_raw: Vec<OsString> = env_args().collect();
+    let argv_opt: Options  = get_argv_options();
 
-    let argv_in: Matches = match argv_opt.parse(&argv_raw[1..]) {
+    let (argv_raw_runas, argv_raw_cmd) = {
+        let separator = argv_raw[1..]
+            .iter()
+            .position(|arg| arg.as_os_str().as_bytes() == b"--")
+            .map(|index| index + 1);
+
+        let (runas, command) = match separator {
+            Some(index) => (&argv_raw[..index], &argv_raw[index + 1..]),
+            None => (&argv_raw[0..], &argv_raw[0..0]),
+        };
+
+        let runas: Vec<String> = runas
+            .iter()
+            .map(|arg| {
+                arg.to_str()
+                    .map(str::to_owned)
+                    .ok_or(Error::StaticMessage(
+                        "command-line argument is not valid UTF-8",
+                    ))
+            })
+            .collect::<Result<_, _>>()?;
+
+        (runas, command)
+    };
+
+    let argv_in: Matches = match argv_opt.parse(&argv_raw_runas[1..]) {
         Ok(m) => m,
         Err(e) => {
-            print_usage(&*argv_raw[0], &argv_opt);
+            print_usage(&*argv_raw_runas[0], &argv_opt);
             return Err(Error::Message(e.to_string()));
         }
+    };
+
+    let target_args = {
+        let mut args: Vec<OsString> = argv_in
+            .free
+            .iter()
+            .map(OsString::from)
+            .collect();
+
+        args.extend(argv_raw_cmd.iter().cloned());
+        args
     };
 
     let shell = argv_in.opt_present("s");
@@ -246,10 +276,10 @@ fn run() -> Result<(), Error> {
     if special_count > 1 {
         return Err(Error::StaticMessage("Options -s, -h and -v are mutually exclusive"));
         
-    } else if (help || ver || shell) && !argv_in.free.is_empty() {
+    } else if (help || ver || shell) && !target_args.is_empty() {
         return Err(Error::StaticMessage("This option does not accept command arguments"));
         
-    } else if !shell && !help && !ver && argv_in.free.is_empty() {
+    } else if !shell && !help && !ver && target_args.is_empty() {
         return Err(Error::StaticMessage("No command specified"));
     }
 
@@ -276,7 +306,7 @@ fn run() -> Result<(), Error> {
         if argv_in.opt_present(opt.name) {
             match *opt {
                 OPT_HELP => {
-                    print_usage(&argv_raw[0], &argv_opt);
+                    print_usage(&argv_raw_runas[0], &argv_opt);
                     return Ok(());
                 }
 
@@ -460,7 +490,7 @@ fn run() -> Result<(), Error> {
 
     // Configure environment and target execution
     if (flags & RunFlags::SHELL) != RunFlags::NONE {
-        if argv_in.free.len() > 0 {
+        if target_args.len() > 0 {
             return Err(Error::StaticMessage("Not expecting arguments with the --shell option"));
             
         } else if (flags & RunFlags::AUTH_STDIN) != RunFlags::NONE {
@@ -530,22 +560,22 @@ fn run() -> Result<(), Error> {
     } else {
         #[cfg(feature = "backend_scopex")]
         {
-            let parts: Option<(&String, &[String])> = argv_in.free.split_first();
-        
+            let parts: Option<(&OsString, &[OsString])> = target_args.split_first();
+
             // Copy all of the argv that execvp() should run
             if let Some((first, rest)) = parts {
                 argv.push(
-                    cstring!(&**first)
+                    cstring!(first.as_bytes())
                 );
-                
+
                 argv.push(
-                    cstring!(&**first)
+                    cstring!(first.as_bytes())
                 );
-                
+
                 // Push all remaining arguments
                 for opt in rest {
                     argv.push(
-                        cstring!(&**opt)
+                        cstring!(opt.as_bytes())
                     );
                 }
             }
@@ -609,9 +639,9 @@ fn run() -> Result<(), Error> {
             argv.push(cstring!("--"));
             
             // Copy all of the argv that systemd-run should execute
-            for opt in argv_in.free {
+            for arg in &target_args {
                 argv.push(
-                    cstring!(opt)
+                    cstring!(arg.as_bytes())
                 );
             }
         }
