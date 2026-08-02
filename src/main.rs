@@ -617,7 +617,7 @@ fn run() -> Result<(), Error> {
     ];
 
     if let Err(err) = load_overwrite_vars(ENV_FILE, &target_user, Some(&placeholders), &mut env) {
-        return Err(err);
+        eprintln!("{}", err);
     }
 
     #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
