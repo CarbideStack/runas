@@ -102,15 +102,19 @@ In addition to `--env` and `--preserve-env`, `runas` can set environment
 variables from `/etc/runas.env`. The file is optional; if it does not exist,
 `runas` continues without an error.
 
-Each non-empty line has the following format:
+Each non-empty line uses one of the following formats:
 
 ```text
 TARGET NAME=VALUE
+TARGET NAME
 ```
 
 `TARGET` is either the resolved target user name or `*` to match every target
-user. Only one variable can be assigned per line. Blank lines and lines whose
-first non-whitespace character is `#` are ignored.
+user. `NAME=VALUE` assigns a value, while a bare `NAME` preserves that variable
+from the invoking process environment. A bare variable is skipped when it is
+missing or its value is not valid UTF-8. `NAME=` explicitly assigns an empty
+value. Only one variable can be assigned or preserved per line. Blank lines
+and lines whose first non-whitespace character is `#` are ignored.
 
 For example:
 
@@ -118,12 +122,15 @@ For example:
 # Applied to every target user
 * EDITOR=/usr/bin/vim
 * RUNAS_TARGET=${USER}
+* DISPLAY
+* SSH_AUTH_SOCK
 
 # Applied only when running as root
 root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 
 # Applied only when running as alice
 alice CACHE_DIR=/var/cache/users/${UID}
+alice TARGET_HOME=${HOME}
 alice TARGET_GROUP=${GROUP}
 alice TARGET_GID=${GID}
 ```
@@ -134,11 +141,12 @@ The following placeholders are replaced using the resolved target account:
 | ----------- | ----------------------------------- |
 | `${USER}`   | Target user name                    |
 | `${GROUP}`  | Target primary or selected group    |
+| `${HOME}`   | Target user's home directory        |
 | `${UID}`    | Numeric target user ID              |
 | `${GID}`    | Numeric target group ID             |
 
 Placeholder replacement is literal. The file is not interpreted by a shell,
-so quoting, command substitution, variable expansion other than the four
+so quoting, command substitution, variable expansion other than the five
 placeholders above, and escape processing are not supported. Leading and
 trailing whitespace around names and values is removed; whitespace inside a
 value is retained.
@@ -157,8 +165,9 @@ chown root:root /etc/runas.env
 chmod 0644 /etc/runas.env
 ```
 
-Failure to read the file, or unsafe ownership or permissions, prevents the
-command from being launched.
+If the file cannot be read or has unsafe ownership or permissions, `runas`
+prints a warning to standard error, ignores the file, and continues launching
+the command. Malformed individual entries are skipped.
 
 ## PAM specifics
 
