@@ -156,6 +156,18 @@ where
         }
     }
 
+    let prepared_placeholders = placeholders.map(|placeholders| {
+        placeholders
+            .iter()
+            .map(|(name, replacement)| {
+                (
+                    format!("${{{}}}", name),
+                    replacement.as_ref(),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+
     let reader = BufReader::new(file);
 
     for line in reader.lines() {
@@ -213,12 +225,11 @@ where
             Some(value) => {
                 let mut value = value.to_owned();
 
-                if let Some(placeholders) = placeholders {
-                    for (name, replacement) in placeholders {
-                        value = value.replace(
-                            &format!("${{{}}}", name),
-                            replacement.as_ref(),
-                        );
+                if let Some(placeholders) = &prepared_placeholders {
+                    for (pattern, replacement) in placeholders {
+                        if value.contains(pattern.as_str()) {
+                            value = value.replace(pattern.as_str(), replacement);
+                        }
                     }
                 }
 
