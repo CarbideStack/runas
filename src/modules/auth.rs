@@ -38,23 +38,91 @@
  */
 
 use crate::{
-    shared::{
-        RunFlags,
-        AUTH_GROUP
-    }
-};
-use super::{
-    error::{
-        Error
+    modules::{
+        error::Error,
+        passwd::ask_password,
+        user::{
+            Account,
+            Group,
+        },
     },
-    user::{
-        Account,
-        Group
-    }
+    shared::{
+        AUTH_GROUP,
+        RunFlags,
+    },
+};
+
+#[cfg(feature = "use_pam")]
+use crate::ffi::pam::{
+    pam_start,
+    AccntFlags,
+    AuthFlags,
+    AuthTokenFlags,
+    Conversation,
+    PamItem,
+    PromptMode,
 };
 
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-use std::collections::HashMap;
+use crate::{
+    ffi::pam::SessionFlags,
+    modules::{
+        fork_sync::{
+            ForkSync,
+            SyncDecision,
+        },
+        proc::{
+            set_parent_exit_signal,
+            watch_process,
+        },
+    },
+};
+
+#[cfg(not(feature = "use_pam"))]
+use crate::{
+    ffi::shadow::{
+        crypt,
+        getspnam,
+    },
+    modules::passwd::time_compare,
+    shared::PROMPT_TEXT,
+};
+
+#[cfg(feature = "use_pam")]
+use nix::unistd::ttyname;
+
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+use nix::{
+    sys::signal::Signal,
+    unistd::{
+        fork,
+        setpgid,
+        ForkResult,
+        Pid,
+    },
+};
+
+#[cfg(feature = "use_pam")]
+use std::{
+    io::{
+        stdin as io_stdin,
+        IsTerminal,
+    },
+    os::unix::io::AsRawFd,
+};
+
+#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+use std::{
+    collections::HashMap,
+    mem::ManuallyDrop,
+    process,
+};
+
+#[cfg(not(feature = "use_pam"))]
+use std::time::{
+    SystemTime,
+    UNIX_EPOCH,
+};
 
 /**
  *
@@ -69,327 +137,220 @@ pub type AuthType = ();
 const DEFAULT_TRUE: Result<AuthType, Error> = Ok(());
 const DEFAULT_FALSE: Result<AuthType, Error> = Err(Error::StaticMessage("authentication failed"));
 
+/**
+ *
+ */
 #[cfg(feature = "use_pam")]
-mod feat {
-    use super::AuthType;
-    use nix::unistd::ttyname;
+struct Conv {
+    flags: RunFlags
+}
 
-    use crate::{
-        shared::RunFlags,
-        ffi::{
-            pam::{
-                pam_start,
-                Conversation,
-                PromptMode,
-                AuthFlags,
-                AuthTokenFlags,
-                AccntFlags,
-                PamItem
-            } 
-        },
-        modules::{
-            passwd::ask_password,
-            user::Account,
-            error::Error
+#[cfg(feature = "use_pam")]
+impl Conversation for Conv {
+    /**
+     *
+     */
+    fn prompt(&mut self, msg: &str, style: PromptMode) -> Result<String, Error> {
+        let mut flags = self.flags;
+        
+        if style == PromptMode::Hidden {
+            flags |= RunFlags::PROMPT_HIDE;
         }
-    };
-
-    use std::{
-        os::unix::io::AsRawFd,
-        io::{
-            IsTerminal,
-            stdin as io_stdin
-        }
-    };
-
-    #[cfg(feature = "backend_scopex")]
-    use std::{
-        process,
-        mem::{
-            drop,
-            ManuallyDrop
-        }
-    };
-
-    #[cfg(feature = "backend_scopex")]
-    use nix::{
-        sys::signal::Signal,
-        unistd::{
-            fork,
-            ForkResult,
-            Pid,
-            setpgid
-        }
-    };
-
-    #[cfg(feature = "backend_scopex")]
-    use crate::{
-        ffi::{
-            pam::SessionFlags
-        },
-        modules::{
-            proc::{
-                watch_process,
-                set_parent_exit_signal
-            },
-            fork_sync::{
-                ForkSync,
-                SyncDecision
-            }
-        }
-    };
+    
+        ask_password(msg, flags)
+    }
+    
+    /**
+     *
+     */
+    fn info(&mut self, msg: &str) -> Result<(), Error> {
+        println!("PAM info: {}", msg);
+        Ok(())
+    }
 
     /**
      *
      */
-    struct Conv {
-        flags: RunFlags
+    fn error(&mut self, msg: &str) -> Result<(), Error> {
+        eprintln!("PAM error: {}", msg);
+        Ok(())
     }
+}
 
-    impl Conversation for Conv {
-        /**
-         *
-         */
-        fn prompt(&mut self, msg: &str, style: PromptMode) -> Result<String, Error> {
-            let mut flags = self.flags;
-            
-            if style == PromptMode::Hidden {
-                flags |= RunFlags::PROMPT_HIDE;
-            }
-        
-            ask_password(msg, flags)
-        }
-        
-        /**
-         *
-         */
-        fn info(&mut self, msg: &str) -> Result<(), Error> {
-            println!("PAM info: {}", msg);
-            Ok(())
-        }
+/**
+ * PAM-based authentication backend.
+ *
+ * Uses the system PAM stack to authenticate a user interactively
+ * through a conversation handler.
+ */
+#[cfg(feature = "use_pam")]
+fn auth(
+        user: &Account, 
+        #[cfg(feature = "backend_scopex")] target: &Account, 
+        flags: RunFlags,
+        #[cfg(feature = "backend_scopex")] disable_auth: bool
+) -> Result<AuthType, Error> {
 
-        /**
-         *
-         */
-        fn error(&mut self, msg: &str) -> Result<(), Error> {
-            eprintln!("PAM error: {}", msg);
-            Ok(())
-        }
-    }
+    let mut conv = Conv {flags};
 
-    /**
-     * PAM-based authentication backend.
-     *
-     * Uses the system PAM stack to authenticate a user interactively
-     * through a conversation handler.
-     */
-    pub(crate) fn auth(
-            user: &Account, 
-            #[cfg(feature = "backend_scopex")] target: &Account, 
-            flags: RunFlags,
-            #[cfg(feature = "backend_scopex")] disable_auth: bool
-    ) -> Result<AuthType, Error> {
+    #[cfg(feature = "backend_scopex")]
+    let pam_user = if disable_auth {
+        target.name()
+    } else {
+        user.name()
+    };
 
-        let mut conv = Conv {flags};
+    #[cfg(not(feature = "backend_scopex"))]
+    let pam_user = user.name();
 
-        #[cfg(feature = "backend_scopex")]
-        let pam_user = if disable_auth {
-            target.name()
-        } else {
-            user.name()
-        };
+    #[cfg(not(feature = "backend_scopex"))]
+    let disable_auth = false;
 
-        #[cfg(not(feature = "backend_scopex"))]
-        let pam_user = user.name();
+    let handle = pam_start(env!("CARGO_PKG_NAME"), pam_user, &mut conv)?;
 
-        #[cfg(not(feature = "backend_scopex"))]
-        let disable_auth = false;
+    if io_stdin().is_terminal() {
+        let fd = io_stdin().as_raw_fd();
 
-        let handle = pam_start(env!("CARGO_PKG_NAME"), pam_user, &mut conv)?;
-
-        if io_stdin().is_terminal() {
-            let fd = io_stdin().as_raw_fd();
-
-            if let Ok(tty_path) = ttyname(fd) {
-                let tty = tty_path.as_os_str().to_string_lossy();
-                handle.set_item(PamItem::Tty, &tty)?;
-                
-            } else {
-                handle.set_item(PamItem::Tty, "/runas")?;
-            }
+        if let Ok(tty_path) = ttyname(fd) {
+            let tty = tty_path.as_os_str().to_string_lossy();
+            handle.set_item(PamItem::Tty, &tty)?;
             
         } else {
             handle.set_item(PamItem::Tty, "/runas")?;
         }
+        
+    } else {
+        handle.set_item(PamItem::Tty, "/runas")?;
+    }
 
-        if !disable_auth {
-            handle.authenticate(AuthFlags::empty())?;
+    if !disable_auth {
+        handle.authenticate(AuthFlags::empty())?;
+    }
+
+    handle.set_item(PamItem::RUser, user.name())?;
+
+    match handle.acct_mgmt(AccntFlags::empty()) {
+        Ok(()) => {}
+
+        Err(Error::PamActionRequired(_))
+            if !flags.contains(RunFlags::AUTH_NO_PROMPT) =>
+        {
+            handle.chauthtok(AuthTokenFlags::CHANGE_EXPIRED_AUTHTOK)?;
         }
 
-        handle.set_item(PamItem::RUser, user.name())?;
+        Err(err) => return Err(err),
+    }
 
-        match handle.acct_mgmt(AccntFlags::empty()) {
-            Ok(()) => {}
+    #[cfg(feature = "backend_scopex")]
+    handle.set_item(PamItem::User, target.name())?;
 
-            Err(Error::PamActionRequired(_))
-                if !flags.contains(RunFlags::AUTH_NO_PROMPT) =>
-            {
-                handle.chauthtok(AuthTokenFlags::CHANGE_EXPIRED_AUTHTOK)?;
+    #[cfg(not(feature = "backend_scopex"))]
+    return Ok(());
+
+    #[cfg(feature = "backend_scopex")]
+    {
+        handle.open_session(SessionFlags::empty())?;
+
+        let sync = ForkSync::new()?;
+        let pam_env = handle.getenvlist()?;
+        let handle = ManuallyDrop::new(handle);
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Child) => {
+                let pipe = sync.into_child();
+
+                set_parent_exit_signal(Signal::SIGKILL)?;
+                setpgid(Pid::from_raw(0), Pid::from_raw(0))?;
+
+                // Notify the parent that we are ready to continue
+                if pipe.ready_and_wait()? != SyncDecision::Continue {
+                    return Err(Error::Unknown);
+                }
+
+                // Everything succeded. Let's get this process running.
+                return Ok(pam_env);
             }
 
-            Err(err) => return Err(err),
-        }
-
-        #[cfg(feature = "backend_scopex")]
-        handle.set_item(PamItem::User, target.name())?;
-
-        #[cfg(not(feature = "backend_scopex"))]
-        return Ok(());
-
-        #[cfg(feature = "backend_scopex")]
-        {
-            handle.open_session(SessionFlags::empty())?;
-
-            let sync = ForkSync::new()?;
-            let pam_env = handle.getenvlist()?;
-            let handle = ManuallyDrop::new(handle);
-
-            match unsafe { fork() } {
-                Ok(ForkResult::Child) => {
-                    let pipe = sync.into_child();
-
-                    set_parent_exit_signal(Signal::SIGKILL)?;
-                    setpgid(Pid::from_raw(0), Pid::from_raw(0))?;
-
-                    // Notify the parent that we are ready to continue
-                    if pipe.ready_and_wait()? != SyncDecision::Continue {
-                        return Err(Error::Unknown);
+            Ok(ForkResult::Parent { child }) => {
+                // Wait for the process and keep PAM session alive
+                let status_code: i32 = match watch_process(child, sync.into_parent()) {
+                    Ok(code) => code,
+                    Err(err) => {
+                        eprintln!("{err}");
+                        1
                     }
+                };
 
-                    // Everything succeded. Let's get this process running.
-                    return Ok(pam_env);
-                }
+                // Ensure that PAM has a chance to quit before terminating
+                drop(ManuallyDrop::into_inner(handle));
+                
+                // Terminate the parent when the child exits
+                process::exit(status_code);
+            }
 
-                Ok(ForkResult::Parent { child }) => {
-                    // Wait for the process and keep PAM session alive
-                    let status_code: i32 = match watch_process(child, sync.into_parent()) {
-                        Ok(code) => code,
-                        Err(err) => {
-                            eprintln!("{err}");
-                            1
-                        }
-                    };
-
-                    // Ensure that PAM has a chance to quit before terminating
-                    drop(ManuallyDrop::into_inner(handle));
-                    
-                    // Terminate the parent when the child exits
-                    process::exit(status_code);
-                }
-
-                Err(err) => {
-                    drop(ManuallyDrop::into_inner(handle));
-                    return Err(Error::from(err));
-                }
+            Err(err) => {
+                drop(ManuallyDrop::into_inner(handle));
+                return Err(Error::from(err));
             }
         }
     }
 }
 
 /**
- *
+ * Shadow-file authentication backend.
  */
 #[cfg(not(feature = "use_pam"))]
-mod feat {
-    use super::{
-        DEFAULT_TRUE,
-        DEFAULT_FALSE,
-        AuthType
-    };
+pub fn auth(user: &Account, flags: RunFlags) -> Result<AuthType, Error> {
+    if let Some(entry) = getspnam(user.name())? {
+        let today = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| (duration.as_secs() / 86_400) as i64)
+            .unwrap_or(i64::MAX);
 
-    use std::{
-        time::{
-            SystemTime,
-            UNIX_EPOCH
+        let passwd_expiry = if entry.last_change == 0 {
+            /*
+                * TODO:
+                *      Add passwd change after password verification? 
+                *       - Instead of failing, verify and prompt for change.
+                */
+            return Err(Error::StaticMessage("password has expired")) // Password change required
+
+        } else if entry.last_change > 0 && entry.max_age >= 0 {
+            match entry.last_change.checked_add(entry.max_age) {
+                Some(expiry) => Some(expiry),
+                None => return Err(Error::StaticMessage("invalid shadow data")), // Invalid shadow data
+            }
+
+        } else {
+            None // Password aging is not configured
+        };
+
+        let accnt_expired = entry.expiry >= 0 && today > entry.expiry;
+        let passwd_expired = passwd_expiry.is_some_and(|expiry| today > expiry);
+        let inactive = entry.inactive >= 0
+            && passwd_expiry
+                .and_then(|expiry| expiry.checked_add(entry.inactive))
+                .is_some_and(|expiry| today > expiry);
+
+        if accnt_expired {
+            return Err(Error::StaticMessage("account has expired"));
+
+        } else if passwd_expired {
+            return Err(Error::StaticMessage("password has expired"));
+
+        } else if inactive {
+            return Err(Error::StaticMessage("account has been disabled due to password inactivity"));
         }
-    };
 
-    use crate::{
-        shared::{
-            RunFlags,
-            PROMPT_TEXT,
-        },
-        modules::{
-            error::Error,
-            user::Account,
-            passwd::{
-                ask_password,
-                time_compare
-            }
-        },
-        ffi::{
-            shadow::{
-                crypt,
-                getspnam
-            }
+        let pwd = ask_password(PROMPT_TEXT, flags | RunFlags::PROMPT_HIDE)?;
+        let user_hash = crypt(pwd, &entry.passwd_hash)?;
+        
+        if time_compare(&user_hash, &entry.passwd_hash) {
+            return DEFAULT_TRUE;
         }
-    };
-
-    /**
-     * Shadow-file authentication backend.
-     */
-    pub fn auth(user: &Account, flags: RunFlags) -> Result<AuthType, Error> {
-        if let Some(entry) = getspnam(user.name())? {
-            let today = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| (duration.as_secs() / 86_400) as i64)
-                .unwrap_or(i64::MAX);
-
-            let passwd_expiry = if entry.last_change == 0 {
-                /*
-                 * TODO:
-                 *      Add passwd change after password verification? 
-                 *       - Instead of failing, verify and prompt for change.
-                 */
-                return Err(Error::StaticMessage("password has expired")) // Password change required
-
-            } else if entry.last_change > 0 && entry.max_age >= 0 {
-                match entry.last_change.checked_add(entry.max_age) {
-                    Some(expiry) => Some(expiry),
-                    None => return Err(Error::StaticMessage("invalid shadow data")), // Invalid shadow data
-                }
-
-            } else {
-                None // Password aging is not configured
-            };
-
-            let accnt_expired = entry.expiry >= 0 && today > entry.expiry;
-            let passwd_expired = passwd_expiry.is_some_and(|expiry| today > expiry);
-            let inactive = entry.inactive >= 0
-                && passwd_expiry
-                    .and_then(|expiry| expiry.checked_add(entry.inactive))
-                    .is_some_and(|expiry| today > expiry);
-
-            if accnt_expired {
-                return Err(Error::StaticMessage("account has expired"));
-
-            } else if passwd_expired {
-                return Err(Error::StaticMessage("password has expired"));
-
-            } else if inactive {
-                return Err(Error::StaticMessage("account has been disabled due to password inactivity"));
-            }
-
-            let pwd = ask_password(PROMPT_TEXT, flags | RunFlags::PROMPT_HIDE)?;
-            let user_hash = crypt(pwd, &entry.passwd_hash)?;
-            
-            if time_compare(&user_hash, &entry.passwd_hash) {
-                return DEFAULT_TRUE;
-            }
-        }
-    
-        DEFAULT_FALSE
     }
+
+    DEFAULT_FALSE
 }
 
 /**
@@ -453,7 +414,7 @@ pub fn authenticate(user: &Account, target: &Account, flags: RunFlags) -> Result
             return DEFAULT_TRUE;
 
             #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-            return feat::auth(user, target, flags, true);
+            return auth(user, target, flags, true);
         }
 
         AuthDecision::Deny => {
@@ -472,10 +433,10 @@ pub fn authenticate(user: &Account, target: &Account, flags: RunFlags) -> Result
             }
 
             #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
-            return feat::auth(user, target, flags, false);
+            return auth(user, target, flags, false);
 
             #[cfg(not(all(feature = "backend_scopex", feature = "use_pam")))]
-            return feat::auth(user, flags);
+            return auth(user, flags);
         }
     }
 }
