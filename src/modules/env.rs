@@ -37,6 +37,7 @@ use std::{
         BufReader
     },
     env::{
+        var as env_var,
         vars as env_vars,
         remove_var as env_remove_var
     }
@@ -183,8 +184,8 @@ where
 
         // Validate VAR=VALUE format
         let (key, value) = match val.split_once('=') {
-            Some((k, v)) => (k.trim(), v.trim()),
-            None => continue,
+            Some((k, v)) => (k.trim(), Some(v.trim())),
+            None => (val.trim(), None),
         };
 
         // Validate environment variable name
@@ -208,18 +209,28 @@ where
             continue;
         }
 
-        let mut value = value.to_owned();
+        match value {
+            Some(value) => {
+                let mut value = value.to_owned();
 
-        if let Some(placeholders) = placeholders {
-            for (name, replacement) in placeholders {
-                value = value.replace(
-                    &format!("${{{}}}", name),
-                    replacement.as_ref(),
-                );
+                if let Some(placeholders) = placeholders {
+                    for (name, replacement) in placeholders {
+                        value = value.replace(
+                            &format!("${{{}}}", name),
+                            replacement.as_ref(),
+                        );
+                    }
+                }
+
+                env.insert(key.to_owned(), value);
+            }
+
+            None => {
+                if let Ok(value) = env_var(key) {
+                    env.insert(key.to_owned(), value);
+                }
             }
         }
-
-        env.insert(key.to_owned(), value);
     }
 
     Ok(())
