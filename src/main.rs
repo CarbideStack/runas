@@ -613,7 +613,8 @@ fn run() -> Result<(), Error> {
         ("USER",  target_user.name()),
         ("GROUP", target_user.group().name()),
         ("UID",   uid.as_str()),
-        ("GID",   gid.as_str())
+        ("GID",   gid.as_str()),
+        ("HOME",  target_user.home())
     ];
 
     if let Err(err) = load_overwrite_vars(ENV_FILE, &target_user, Some(&placeholders), &mut env) {
