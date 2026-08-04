@@ -32,18 +32,20 @@ __Features__
 |     --preserve-env    | LIST    | Comma separated list of variables to preserve   |
 | -n, --non-interactive |         | Non-interactive mode, don't prompt for password |
 | -S, --stdin           |         | Read password from standard input               |
+| -A, --askpass         |         | Use an askpass helper program (build-time option) |
 | -v, --version         |         | Display version information and exit            |
 | --                    |         | Stop processing command line arguments          |
 
 
 __Build Features__
 
-| Flag               | Description                                                            |
-| ------------------ | ---------------------------------------------------------------------- |
-| use_pam            | This will build runas with PAM support.                                |
-| backend_run0       | This will build runas to target run0 instead of systemd-run directly   |
-| backend_scopex     | This will build runas with it's own backend implementation             |
-| without_expand_env | This will build runas without --expand-environment=false (systemd-run) |
+| Flag                    | Description                                                            |
+| ----------------------- | ---------------------------------------------------------------------- |
+| use_pam                 | This will build runas with PAM support.                                |
+| backend_run0            | This will build runas to target run0 instead of systemd-run directly   |
+| backend_scopex          | This will build runas with it's own backend implementation             |
+| with_askpass_support    | This will build runas with `--askpass` support.                         |
+| without_expand_env      | This will build runas without --expand-environment=false (systemd-run) |
 
 ## Security posture & assumptions
 
@@ -77,6 +79,13 @@ Build commands demonstrate how to enable different features. Features are additi
 
     > You must manually add `-l pam` to the `RUSTFLAGS` environment variable. Sadly there is no way to do this automatically via cargo.toml or build.rs.
 
+- Build with askpass support:
+    ```bash
+    cargo build --release --features "with_askpass_support"
+    ```
+
+    > Askpass is a separate, opt-in feature because it adds another path for supplying authentication credentials. Mistakes in this security-sensitive code could potentially introduce an authentication bypass. Only enable it when askpass integration is required.
+
 - Omit systemd's "--expand-environment=false" option (available when building for systemd-run):
     ```bash
     cargo build --release --features "without_expand_env"
@@ -95,6 +104,22 @@ absolute path can be selected at build time using `RUNAS_SYSTEMD_PATH`:
 ```bash
 RUNAS_SYSTEMD_PATH=/custom/path/systemd-run cargo build --release
 ```
+
+### Askpass helper
+
+When built with the `with_askpass_support` feature, `-A` or `--askpass` reads
+the password from an external helper instead of the terminal. Set
+`RUNAS_ASKPASS` to the helper's absolute path:
+
+```bash
+RUNAS_ASKPASS=/usr/libexec/seahorse/ssh-askpass runas --askpass command
+```
+
+For compatibility with existing sudo askpass configurations, `runas` falls
+back to `SUDO_ASKPASS` when `RUNAS_ASKPASS` is unset or empty. If both are set,
+`RUNAS_ASKPASS` takes precedence. The helper receives the password prompt as
+its first argument and must write the password to standard output. The helper
+path must be absolute.
 
 ## Environment configuration
 

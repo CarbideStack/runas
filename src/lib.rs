@@ -38,7 +38,10 @@ pub mod modules {
     pub(crate) mod passwd;
     pub(crate) mod signal_recv;
 
-    #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+    #[cfg(any(
+        all(feature = "backend_scopex", feature = "use_pam"), 
+        feature = "with_askpass_support"
+    ))]
     pub(crate) mod fork_sync;
 
     #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]

@@ -41,6 +41,17 @@ use crate::{
         error::Error
     }
 };
+
+#[cfg(feature = "with_askpass_support")]
+use crate::modules::{
+    env::clean_environment,
+    fork_sync::{
+        ForkSync,
+        SyncDecision,
+    },
+    proc::set_parent_exit_signal,
+};
+
 use zeroize::Zeroizing;
 use nix::{
     errno::Errno,
@@ -77,11 +88,49 @@ use nix::{
         write
     }
 };
+
+#[cfg(feature = "with_askpass_support")]
+use nix::{
+    libc::{
+        prctl,
+        PR_SET_NO_NEW_PRIVS,
+        STDOUT_FILENO,
+    },
+    sys::{
+        signal,
+        wait::{
+            waitpid,
+            WaitPidFlag,
+            WaitStatus,
+        },
+    },
+    unistd::{
+        dup2,
+        execv,
+        fork,
+        getgid,
+        getuid,
+        pipe,
+        setpgid,
+        setresgid,
+        setresuid,
+        ForkResult,
+        Pid,
+    },
+};
+
+use std::os::unix::io::{
+    AsRawFd, 
+    RawFd
+};
+
+#[cfg(feature = "with_askpass_support")]
 use std::{
-    os::unix::io::{
-        AsRawFd, 
-        RawFd
-    }
+    convert::Infallible,
+    env::var_os,
+    ffi::CString,
+    os::unix::ffi::OsStrExt,
+    path::Path,
 };
 
 /**
@@ -103,12 +152,27 @@ const PROMPT_SIGNALS: &[Signal] = &[
 /**
  *
  */
+#[cfg(feature = "with_askpass_support")]
+const HELPER_SIGNALS: &[Signal] = &[
+    Signal::SIGCHLD,
+    Signal::SIGHUP,
+    Signal::SIGINT,
+    Signal::SIGQUIT,
+    Signal::SIGTERM,
+    Signal::SIGTSTP,
+    Signal::SIGCONT,
+];
+
+/**
+ *
+ */
 struct Prompt {
     input: RawFd,
     output: RawFd,
     interrupt: RawFd,
     owned: bool,
     termios: Option<Termios>,
+    input_eof: bool,
 }
 
 impl Prompt {
@@ -122,6 +186,7 @@ impl Prompt {
             interrupt,
             owned,
             termios: None,
+            input_eof: false
         }
     }
 
@@ -143,6 +208,14 @@ impl Prompt {
         tcsetattr(self.input, SetArg::TCSANOW, &changed)?;
 
         Ok(())
+    }
+
+    /**
+     *
+     */
+    #[allow(dead_code)]
+    fn eof(&mut self) -> bool {
+        return self.input_eof;
     }
 
     /**
@@ -176,9 +249,15 @@ impl Prompt {
      */
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Errno> {
         loop {
+            let input = if self.input_eof {
+                -1
+            } else {
+                self.input
+            };
+
             let mut descriptors = [
-                PollFd::new(self.input, PollFlags::POLLIN),
                 PollFd::new(self.interrupt, PollFlags::POLLIN),
+                PollFd::new(input, PollFlags::POLLIN),
             ];
 
             match poll(&mut descriptors, -1) {
@@ -187,7 +266,7 @@ impl Prompt {
                 Err(error) => return Err(error),
             }
 
-            let interrupt_events = descriptors[1].revents().unwrap_or(PollFlags::empty());
+            let interrupt_events = descriptors[0].revents().unwrap_or(PollFlags::empty());
 
             if interrupt_events.contains(PollFlags::POLLIN) {
                 return Err(Errno::EINTR);
@@ -196,13 +275,21 @@ impl Prompt {
                 return Err(Errno::EIO);
             }
 
-            let input_events = descriptors[0].revents().unwrap_or(PollFlags::empty());
+            if !self.input_eof {
+                let input_events = descriptors[1].revents().unwrap_or(PollFlags::empty());
 
-            if input_events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
-                return read(self.input, buf);
+                if input_events.intersects(PollFlags::POLLIN | PollFlags::POLLHUP) {
+                    let count = read(self.input, buf)?;
 
-            } else if input_events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
-                return Err(Errno::EIO);
+                    if count == 0 {
+                        self.input_eof = true;
+                    }
+
+                    return Ok(count);
+
+                } else if input_events.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL) {
+                    return Err(Errno::EIO);
+                }
             }
         }
     }
@@ -337,6 +424,210 @@ fn launch_prompt(msg: &str, flags: RunFlags) -> Result<String, Error> {
 }
 
 /**
+ * 
+ */
+#[cfg(feature = "with_askpass_support")]
+fn launch_helper(msg: &str) -> Result<String, Error> {
+    let (passwd_read, passwd_write) = pipe()?;
+    let sync = ForkSync::new()?;
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Child) => {
+            let Err(err) = (|| -> Result<Infallible, Error> {
+                // Child never reads from this pipe.
+                close(passwd_read)?;
+
+                if passwd_write != STDOUT_FILENO {
+                    dup2(passwd_write, STDOUT_FILENO)?;
+                    close(passwd_write)?;
+                }
+
+                // child should not have access to the Runas stdin
+                let null_fd = open("/dev/null", OFlag::O_RDONLY, Mode::empty())?;
+
+                if null_fd != STDIN_FILENO {
+                    dup2(null_fd, STDIN_FILENO)?;
+                    close(null_fd)?;
+                }
+
+                let uid = getuid();
+                let gid = getgid();
+
+                // Lower the privileges from the setuid
+                setresgid(gid, gid, gid)?;
+                setresuid(uid, uid, uid)?;
+
+                set_parent_exit_signal(Signal::SIGKILL)?;
+
+                let sync = sync.into_child();
+
+                if sync.ready_and_wait()? != SyncDecision::Continue {
+                    return Err(Error::Unknown);
+                }
+
+                // Do not allow further privilege to be set by setuid etc. on the target binary
+                Errno::result(unsafe {
+                    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+                })?;
+
+                let helper = var_os("RUNAS_ASKPASS")
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| {
+                        var_os("SUDO_ASKPASS")
+                            .filter(|value| !value.is_empty())
+                    })
+                    .ok_or(Error::StaticMessage(
+                        "RUNAS_ASKPASS is configured",
+                    ))?;
+
+                clean_environment();
+
+                if !Path::new(&helper).is_absolute() {
+                    return Err(Error::StaticMessage(
+                        "RUNAS_ASKPASS must contain an absolute path"
+                    ));
+                }
+
+                let helper = CString::new(helper.as_os_str().as_bytes())?;
+                let prompt = CString::new(msg)?;
+
+                let argv = [
+                    helper.clone(),
+                    prompt,
+                ];
+
+                return execv(&helper, &argv).map_err(Error::from);
+
+            })();
+
+            eprintln!("{}", err);
+            std::process::exit(1);
+        }
+
+        Ok(ForkResult::Parent { child }) => {
+            // Parent never writes to this pipe.
+            close(passwd_write)?;
+            setpgid(child, child)?;
+
+            let mut signals = SignalReceiver::install(HELPER_SIGNALS.iter().copied())?;
+            let mut prompt = Prompt::new(
+                passwd_read,
+                passwd_read, // unused 
+                signals.as_raw_fd(),
+                true,
+            );
+
+            let sync = sync.into_parent();
+
+            if sync.ready_and_wait()? != SyncDecision::Continue {
+                return Err(Error::StaticMessage(
+                    "askpass helper failed during startup"
+                ));
+            }
+
+            let mut buffer = Zeroizing::new(Vec::with_capacity(MAX_INPUT_LEN));
+            let mut chunk = Zeroizing::new([0u8; 128]);
+            let mut overflow = false;
+            let mut child_status: Option<i32> = None;
+
+            let flags = WaitPidFlag::WUNTRACED | WaitPidFlag::WCONTINUED | WaitPidFlag::WNOHANG;
+
+            loop {
+                match prompt.read(&mut chunk[..]) {
+                    // Wait for child to exit
+                    Ok(0) => {},
+
+                    Ok(count) => {
+                        let remaining = (MAX_INPUT_LEN + 1).saturating_sub(buffer.len());
+                        let accepted = count.min(remaining);
+
+                        buffer.extend_from_slice(&chunk[..accepted]);
+
+                        if accepted != count {
+                            overflow = true;
+                        }
+                    }
+
+                    Err(Errno::EINTR) => {
+                        let Some(event) = signals.read()? else {
+                            continue;
+                        };
+
+                        let signal = event.signal().ok_or_else(|| {
+                            Error::Message(format!(
+                                "invalid signal number {}",
+                                event.raw_signal()
+                            ))
+                        })?;
+
+                        if signal == Signal::SIGCHLD {
+                            loop {
+                                match waitpid(child, Some(flags)) {
+                                    Ok(WaitStatus::Exited(_, code)) => {
+                                        child_status = Some(code);
+                                        break;
+                                    }
+
+                                    Ok(WaitStatus::Signaled(_, sig, _)) => {
+                                        child_status = Some(128 + sig as i32);
+                                        break;
+                                    }
+                                    
+                                    Ok(WaitStatus::StillAlive) => break,
+                                    Ok(_) => continue,
+
+                                    Err(Errno::EINTR) => continue,
+                                    Err(error) => return Err(Error::from(error))
+                                }
+                            }
+
+                        } else {
+                            let _ = signal::kill(Pid::from_raw(-child.as_raw()), signal);
+                        }
+                    }
+
+                    Err(error) => {
+                        return Err(Error::from(error));
+                    }
+                }
+
+                if prompt.eof() && child_status.is_some() {
+                    break;
+                }
+            }
+
+            let status = child_status.ok_or(Error::StaticMessage("askpass helper status is unavailable"))?;
+
+            if status != 0 {
+                return Err(Error::Message(
+                    format!("askpass helper exited with status {}", status)
+                ));
+            }
+
+            if buffer.last() == Some(&b'\n') {
+                buffer.pop();
+
+                if buffer.last() == Some(&b'\r') {
+                    buffer.pop();
+                }
+            }
+
+            if overflow || buffer.len() > MAX_INPUT_LEN {
+                return Err(Error::Message(
+                    format!("input exceeds the maximum length of {} bytes", MAX_INPUT_LEN)
+                ));
+            }
+            
+            return Ok(std::str::from_utf8(&buffer)?.to_owned());
+        }
+
+        Err(err) => {
+            return Err(Error::from(err));
+        }
+    }
+}
+
+/**
  * Compare two strings in constant time.
  *
  * This function ensures consistent runtime regardless of input similarity
@@ -401,6 +692,11 @@ pub(crate) fn time_compare(known: &str, secret: &str) -> bool {
  * - `flags`: Behavior control flags (`RunFlags::AUTH_STDIN`, etc.).
  */
 pub(crate) fn ask_password(msg: &str, flags: RunFlags) -> Result<String, Error> {
+    #[cfg(feature = "with_askpass_support")]
+    if flags.contains(RunFlags::AUTH_ASKPASS) {
+        return launch_helper(msg);
+    }
+
     loop {
         match launch_prompt(msg, flags) {
             Ok(password) => return Ok(password),

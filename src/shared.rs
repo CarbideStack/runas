@@ -40,11 +40,12 @@ pub const ENV_FILE: &'static str = "/etc/runas.env";
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct RunFlags: u32 {
-        const NONE = 0x00;              // No flags
-        const SHELL = 0x01;             // Process should launch a shell
-        const AUTH_STDIN = 0x20;        // Read password from stdin
-        const AUTH_NO_PROMPT = 0x40;    // Do not launch a prompt for this process
-        const PROMPT_HIDE = 0x80;       // Prompt should not display what is being typed
+        const NONE           = 0x000;   // No flags
+        const SHELL          = 0x001;   // Process should launch a shell
+        const AUTH_STDIN     = 0x020;   // Read password from stdin
+        const AUTH_NO_PROMPT = 0x040;   // Do not launch a prompt for this process
+        const PROMPT_HIDE    = 0x080;   // Prompt should not display what is being typed
+        const AUTH_ASKPASS   = 0x100;   // Use 3'rd party program as password prompt
     }
 }
 

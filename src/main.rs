@@ -127,6 +127,13 @@ const OPT_ENV      : CliOption  =  CliOption { flag: EMPTY, name: "env",        
 const OPT_PRESERVE : CliOption  =  CliOption { flag: EMPTY, name: "preserve-env",    desc: "Comma separated list of variables to preserve",     val: "LIST"  };
 const OPT_CHDIR    : CliOption  =  CliOption { flag: "D",   name: "chdir",           desc: "Run the command in the specified directory",        val: "PATH"  };
 
+#[cfg(feature = "with_askpass_support")]
+const OPT_ASKPASS  : CliOption  =  CliOption { flag: "A",   name: "askpass",         desc: "Use an askpass helper program",                     val: EMPTY   };
+
+#[cfg(feature = "with_askpass_support")]
+const ARGV_SCHEME: &[CliOption] = &[OPT_USER, OPT_GROUP, OPT_SHELL, OPT_HELP, OPT_NONINT, OPT_STDIN, OPT_ASKPASS, OPT_VERSION, OPT_ENV, OPT_PRESERVE, OPT_CHDIR];
+
+#[cfg(not(feature = "with_askpass_support"))]
 const ARGV_SCHEME: &[CliOption] = &[OPT_USER, OPT_GROUP, OPT_SHELL, OPT_HELP, OPT_NONINT, OPT_STDIN, OPT_VERSION, OPT_ENV, OPT_PRESERVE, OPT_CHDIR];
 
 /**
@@ -446,6 +453,9 @@ fn run() -> Result<(), Error> {
                 OPT_SHELL  => flags |= RunFlags::SHELL,
                 OPT_STDIN  => flags |= RunFlags::AUTH_STDIN,
                 OPT_NONINT => flags |= RunFlags::AUTH_NO_PROMPT,
+
+                #[cfg(feature = "with_askpass_support")]
+                OPT_ASKPASS  => flags |= RunFlags::AUTH_ASKPASS,
                 
                 _ => NULL
             }
@@ -558,6 +568,15 @@ fn run() -> Result<(), Error> {
         }
 
     } else {
+        #[cfg(feature = "with_askpass_support")]
+        if flags.contains(RunFlags::AUTH_STDIN)
+            && flags.contains(RunFlags::AUTH_ASKPASS)
+        {
+            return Err(Error::StaticMessage(
+                "The --stdin option is not allowed combined with the --askpass option"
+            ));
+        }
+
         #[cfg(feature = "backend_scopex")]
         {
             let parts: Option<(&OsString, &[OsString])> = target_args.split_first();

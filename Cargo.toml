@@ -25,6 +25,7 @@ zeroize = "1.5"
 bindgen = { version = "0.66", optional = true }
 
 [features]
+with_askpass_support = []       # Build with support for --askpass, -H 
 without_expand_env = []         # cargo build --features without_expand_env
 use_pam = ["bindgen"]           # RUSTFLAGS="-l pam" cargo build --features use_pam
 backend_run0 = []               # Use run0 instead of systemd-run directly

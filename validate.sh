@@ -22,38 +22,55 @@ list_configurations() {
     done
 }
 
-case $# in
-    0)
-        selected=("${!configurations[@]}")
-        ;;
-    1)
-        case $1 in
-            -l|--list)
-                list_configurations
-                exit 0
-                ;;
-            *[!0-9]*|"")
-                echo "Usage: $0 [--list|build-number]" >&2
+with_askpass=false
+continue_builds=false
+selected=()
+
+for argument in "$@"; do
+    case $argument in
+        --with-askpass)
+            with_askpass=true
+            ;;
+        --continue)
+            continue_builds=true
+            ;;
+        -l|--list)
+            list_configurations
+            exit 0
+            ;;
+        *[!0-9]*|"")
+            echo "Usage: $0 [--with-askpass] [--continue] [--list|build-number]" >&2
+            exit 2
+            ;;
+        *)
+            if (( ${#selected[@]} != 0 )); then
+                echo "Usage: $0 [--with-askpass] [--continue] [--list|build-number]" >&2
                 exit 2
-                ;;
-            *)
-                build_number=$((10#$1))
+            fi
 
-                if (( build_number < 1 || build_number > ${#configurations[@]} )); then
-                    echo "Unknown build number: $1" >&2
-                    list_configurations >&2
-                    exit 2
-                fi
+            build_number=$((10#$argument))
 
-                selected=("$((build_number - 1))")
-                ;;
-        esac
-        ;;
-    *)
-        echo "Usage: $0 [--list|build-number]" >&2
-        exit 2
-        ;;
-esac
+            if (( build_number < 1 || build_number > ${#configurations[@]} )); then
+                echo "Unknown build number: $argument" >&2
+                list_configurations >&2
+                exit 2
+            fi
+
+            selected=("$((build_number - 1))")
+            ;;
+    esac
+done
+
+if (( ${#selected[@]} == 0 )); then
+    selected=("${!configurations[@]}")
+fi
+
+if $with_askpass; then
+    for index in "${selected[@]}"; do
+        IFS='|' read -r name features <<< "${configurations[index]}"
+        configurations[index]="$name|${features:+$features,}with_askpass_support"
+    done
+fi
 
 clear_screen
 
@@ -80,6 +97,10 @@ for position in "${!selected[@]}"; do
         echo "===================="
         echo
 
+        if $continue_builds; then
+            break
+        fi
+
         if (( position + 1 < ${#selected[@]} )); then
             prompt="Press Enter to continue, or R to re-run: "
         else
@@ -105,5 +126,7 @@ for position in "${!selected[@]}"; do
         clear_screen
     done
 
-    clear_screen
+    if ! $continue_builds; then
+        clear_screen
+    fi
 done

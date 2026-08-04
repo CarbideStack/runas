@@ -55,6 +55,12 @@ use nix::unistd::{
     setresuid,
 };
 
+#[cfg(feature = "with_askpass_support")]
+use nix::libc;
+
+#[cfg(any(feature = "backend_scopex", feature = "with_askpass_support"))]
+use nix::errno::Errno;
+
 #[cfg(feature = "backend_scopex")]
 use nix::{
     libc::{
@@ -62,7 +68,6 @@ use nix::{
         gid_t
     },
     unistd::execve,
-    errno::Errno
 };
 
 #[cfg(not(feature = "backend_scopex"))]
@@ -72,10 +77,18 @@ use nix::unistd::{
     Uid,
 };
 
+#[cfg(any(
+    all(feature = "backend_scopex", feature = "use_pam"),
+    feature = "with_askpass_support"
+))]
+use nix::{
+    sys::signal::Signal
+};
+
 #[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
 use nix::{
     sys::{
-        signal::{self, Signal},
+        signal,
         wait::{
             waitpid,
             WaitPidFlag,
@@ -180,7 +193,10 @@ pub(crate) fn watch_process(pid: Pid, pipe: ForkEndpoint) -> Result<i32, Error> 
 /**
  * 
  */
-#[cfg(all(feature = "backend_scopex", feature = "use_pam"))]
+#[cfg(any(
+    all(feature = "backend_scopex", feature = "use_pam"), 
+    feature = "with_askpass_support"
+))]
 pub(crate) fn set_parent_exit_signal(signal: Signal) -> Result<(), Errno> {
     let result = unsafe {
         libc::prctl(
